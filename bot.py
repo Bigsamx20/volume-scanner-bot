@@ -678,6 +678,7 @@ Commands:
 
 /start
 /help
+/test_alert
 /add_rule <interval> <side> <threshold_percent> <baseline_candles> <ALL_USDT or symbols>
 /list_rules
 /delete_rule <rule_id>
@@ -685,6 +686,7 @@ Commands:
 
 Examples:
 
+/test_alert
 /add_rule 5m buy 10 20 ALL_USDT
 /add_rule 1h buy 7.5 20 ALL_USDT
 /add_rule 5m sell 12 15 BTCUSDT,ETHUSDT,SOLUSDT
@@ -701,6 +703,26 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await reply_text_safe(update, HELP_TEXT.strip())
+
+async def test_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat is None:
+        return
+
+    msg = (
+        "🧪 TEST ALERT\n\n"
+        "Symbol: BTCUSDT\n"
+        "Interval: 5m\n"
+        "Threshold: 5.00%\n"
+        "Baseline: last 10 candles\n"
+        "Live buy volume: 12345.678900\n"
+        "Average buy volume: 10000.000000\n"
+        "Spike: +23.46%\n"
+        "Price: 65000.00\n"
+        "Elapsed in candle: 01m 12s\n"
+        f"Chart: {tradingview_link('BTCUSDT')}"
+    )
+
+    await reply_text_safe(update, msg)
 
 async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat is None:
@@ -944,6 +966,7 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("test_alert", test_alert_cmd))
     application.add_handler(CommandHandler("add_rule", add_rule_cmd))
     application.add_handler(CommandHandler("list_rules", list_rules_cmd))
     application.add_handler(CommandHandler("delete_rule", delete_rule_cmd))
