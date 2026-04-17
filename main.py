@@ -67,7 +67,7 @@ def rsi(values, length=14):
 def heartbeat():
     while True:
         print("BOT ALIVE ✅")
-        time.sleep(HEARTBEAT_SECONDS))
+        time.sleep(HEARTBEAT_SECONDS)
 
 
 def fetch_history(symbol, tf):
