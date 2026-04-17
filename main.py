@@ -9,8 +9,11 @@ TIMEFRAMES = [tf.strip() for tf in os.getenv("TIMEFRAMES", "1,5,60").split(",") 
 RSI_ENABLED = os.getenv("RSI_ENABLED", "true").lower() == "true"
 EMA_ENABLED = os.getenv("EMA_ENABLED", "true").lower() == "true"
 
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "300"))
+
 # ===== STATE =====
 data = {}
+session = None
 
 
 def init_state():
@@ -59,6 +62,57 @@ def rsi(values, length=14):
     return 100 - (100 / (1 + rs))
 
 
+def fetch_history(symbol, tf):
+    try:
+        response = session.get_kline(
+            category="linear",
+            symbol=symbol,
+            interval=tf,
+            limit=HISTORY_LIMIT
+        )
+
+        rows = response.get("result", {}).get("list", [])
+        if not rows:
+            print(f"No history found for {symbol} {tf}")
+            return
+
+        rows.reverse()  # oldest -> newest
+        closes = []
+
+        for row in rows:
+            try:
+                closes.append(float(row[4]))
+            except (TypeError, ValueError, IndexError):
+                continue
+
+        data[symbol][tf] = closes
+        print(f"Loaded history: {symbol} {tf} ({len(closes)} candles)")
+
+        process_indicators(symbol, tf, closes[-1] if closes else None)
+
+    except Exception as e:
+        print(f"History fetch error {symbol} {tf}: {e}")
+
+
+def process_indicators(symbol, tf, arr_last_close):
+    arr = data[symbol][tf]
+    close = arr_last_close
+
+    if close is None:
+        return
+
+    if RSI_ENABLED:
+        r = rsi(arr)
+        if r is not None:
+            print(f"{symbol} {tf} RSI: {r:.2f}")
+
+    if EMA_ENABLED:
+        e = ema(arr, 200)
+        if e is not None:
+            dist = ((close - e) / e) * 100
+            print(f"{symbol} {tf} EMA200 DIST: {dist:.2f}%")
+
+
 def handle(msg):
     try:
         if not isinstance(msg, dict):
@@ -89,10 +143,7 @@ def handle(msg):
             except (TypeError, ValueError):
                 continue
 
-            if symbol not in data:
-                continue
-
-            if tf not in data[symbol]:
+            if symbol not in data or tf not in data[symbol]:
                 continue
 
             if not confirm:
@@ -101,32 +152,27 @@ def handle(msg):
             arr = data[symbol][tf]
             arr.append(close)
 
-            if len(arr) > 300:
+            if len(arr) > HISTORY_LIMIT:
                 arr.pop(0)
 
-            if RSI_ENABLED:
-                r = rsi(arr)
-                if r is not None:
-                    print(f"{symbol} {tf} RSI: {r:.2f}")
-
-            if EMA_ENABLED:
-                e = ema(arr, 200)
-                if e is not None:
-                    dist = ((close - e) / e) * 100
-                    print(f"{symbol} {tf} EMA200 DIST: {dist:.2f}%")
+            process_indicators(symbol, tf, close)
 
     except Exception as e:
         print("error:", e)
 
 
 def main():
+    global session
+
     init_state()
 
     print("Starting bot...")
 
-    # Kept for later when you add historical candle loading
     session = HTTP(testnet=False)
-    _ = session
+
+    for symbol in SYMBOLS:
+        for tf in TIMEFRAMES:
+            fetch_history(symbol, tf)
 
     ws = WebSocket(testnet=False, channel_type="linear")
 
