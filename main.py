@@ -20,48 +20,23 @@ SHORTLIST_REFRESH_SECONDS = int(os.getenv("SHORTLIST_REFRESH_SECONDS", "300"))
 REQUEST_SLEEP_SECONDS = float(os.getenv("REQUEST_SLEEP_SECONDS", "0.12"))
 HEARTBEAT_TO_TELEGRAM = os.getenv("HEARTBEAT_TO_TELEGRAM", "true").lower() == "true"
 
-TIMEFRAMES = ["1", "5", "60"]
+# 1h only
+TIMEFRAMES = ["60"]
 
 # =========================
 # DEFAULT SETTINGS FOR ALL SYMBOLS
-# RSI default: overbought=80, oversold=25
-# EMA stays enabled
+# RSI defaults:
+# overbought = 85
+# oversold = 20
+# EMA200 settings unchanged
 # =========================
 TIMEFRAME_DEFAULTS = {
-    "1": {
-        "rsi": {
-            "enabled": True,
-            "length": 14,
-            "overbought": 80,
-            "oversold": 25,
-        },
-        "ema_distance": {
-            "enabled": True,
-            "ema_length": 200,
-            "above_percent": 2.0,
-            "below_percent": -2.0,
-        },
-    },
-    "5": {
-        "rsi": {
-            "enabled": True,
-            "length": 14,
-            "overbought": 80,
-            "oversold": 25,
-        },
-        "ema_distance": {
-            "enabled": True,
-            "ema_length": 200,
-            "above_percent": 2.0,
-            "below_percent": -2.0,
-        },
-    },
     "60": {
         "rsi": {
             "enabled": True,
             "length": 14,
-            "overbought": 80,
-            "oversold": 25,
+            "overbought": 85,
+            "oversold": 20,
         },
         "ema_distance": {
             "enabled": True,
@@ -73,7 +48,17 @@ TIMEFRAME_DEFAULTS = {
 }
 
 # Optional per-symbol overrides
-SYMBOL_OVERRIDES = {}
+SYMBOL_OVERRIDES = {
+    # Example:
+    # "BTCUSDT": {
+    #     "60": {
+    #         "rsi": {
+    #             "overbought": 90,
+    #             "oversold": 18,
+    #         }
+    #     }
+    # }
+}
 
 # =========================
 # GLOBALS
@@ -85,7 +70,6 @@ shortlist = set()
 shortlist_lock = threading.Lock()
 ws_connections = {}
 
-# Track live candle start times so alerts trigger only once per candle
 current_candle_start = {}
 last_closed_candle_start = {}
 
@@ -95,6 +79,7 @@ last_closed_candle_start = {}
 # =========================
 def send_telegram(message: str):
     if not TELEGRAM_ENABLED:
+        print("Telegram disabled (TELEGRAM_ENABLED is not true)")
         return
 
     if not BOT_TOKEN or not CHAT_ID:
@@ -108,7 +93,7 @@ def send_telegram(message: str):
             json={"chat_id": CHAT_ID, "text": message},
             timeout=10,
         )
-        print("Telegram status:", response.status_code)
+        print("Telegram status:", response.status_code, response.text)
     except Exception as e:
         print("Telegram error:", e)
 
@@ -129,6 +114,16 @@ def safe_float(value, default=None):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def normalize_interval(interval_value):
+    s = str(interval_value).strip().lower()
+    mapping = {
+        "60": "60",
+        "60m": "60",
+        "1h": "60",
+    }
+    return mapping.get(s, s)
 
 
 def ensure_symbol_state(symbol: str):
@@ -224,9 +219,6 @@ def get_tickers():
 
 def build_shortlist_from_tickers():
     tickers = get_tickers()
-
-    one_min_candidates = []
-    five_min_candidates = []
     one_hour_candidates = []
 
     for item in tickers:
@@ -250,19 +242,10 @@ def build_shortlist_from_tickers():
         else:
             one_hour_candidates.append((symbol, 0.0, turnover_24h))
 
-        one_min_candidates.append((symbol, turnover_24h))
-        five_min_candidates.append((symbol, turnover_24h))
-
-    one_min_candidates.sort(key=lambda x: x[1], reverse=True)
-    five_min_candidates.sort(key=lambda x: x[1], reverse=True)
     one_hour_candidates.sort(key=lambda x: x[1], reverse=True)
-
-    liquid_1m = [s for s, _ in one_min_candidates[: max(TOP_N * 3, 60)]]
-    liquid_5m = [s for s, _ in five_min_candidates[: max(TOP_N * 3, 60)]]
     top_1h = [s for s, _, _ in one_hour_candidates[:TOP_N]]
 
-    symbols = set(liquid_1m) | set(liquid_5m) | set(top_1h)
-    return sorted(symbols)
+    return sorted(set(top_1h))
 
 
 # =========================
@@ -281,6 +264,7 @@ def fetch_history(symbol: str, tf: str):
 
         rows = response.get("result", {}).get("list", [])
         if not rows:
+            print(f"No history rows for {symbol} {tf}")
             return
 
         rows.reverse()
@@ -296,6 +280,7 @@ def fetch_history(symbol: str, tf: str):
 
         if closes:
             data[symbol][tf] = closes
+            print(f"Loaded history: {symbol} {tf} candles={len(closes)}")
 
     except Exception as e:
         print(f"History fetch error {symbol} {tf}: {e}")
@@ -355,6 +340,7 @@ def get_top_gainers_from_history(tf: str, top_n: int):
 def process_indicators(symbol: str, tf: str, candle_start: int):
     arr = data.get(symbol, {}).get(tf, [])
     if not arr:
+        print(f"No data for {symbol} {tf}")
         return
 
     close = arr[-1]
@@ -374,6 +360,7 @@ def process_indicators(symbol: str, tf: str, candle_start: int):
             oversold = float(rsi_cfg.get("oversold", 20))
 
             if r >= overbought:
+                print(f"RSI overbought condition met: {symbol} {tf}")
                 if should_alert_once_per_candle("rsi_overbought", symbol, tf, candle_start):
                     send_telegram(
                         f"🚨 RSI OVERBOUGHT\n"
@@ -384,6 +371,7 @@ def process_indicators(symbol: str, tf: str, candle_start: int):
                     )
 
             if r <= oversold:
+                print(f"RSI oversold condition met: {symbol} {tf}")
                 if should_alert_once_per_candle("rsi_oversold", symbol, tf, candle_start):
                     send_telegram(
                         f"🚨 RSI OVERSOLD\n"
@@ -401,10 +389,11 @@ def process_indicators(symbol: str, tf: str, candle_start: int):
             dist = ((close - ema_value) / ema_value) * 100
             print(f"{symbol} {tf} EMA{ema_length} DIST: {dist:.2f}%")
 
-            above_percent = float(ema_cfg.get("above_percent", 2.0))
-            below_percent = float(ema_cfg.get("below_percent", -2.0))
+            above_percent = float(ema_cfg.get("above_percent", 20.0))
+            below_percent = float(ema_cfg.get("below_percent", -20.0))
 
             if dist >= above_percent:
+                print(f"EMA above condition met: {symbol} {tf}")
                 if should_alert_once_per_candle("ema_above", symbol, tf, candle_start):
                     send_telegram(
                         f"📈 PRICE ABOVE EMA{ema_length}\n"
@@ -415,6 +404,7 @@ def process_indicators(symbol: str, tf: str, candle_start: int):
                     )
 
             if dist <= below_percent:
+                print(f"EMA below condition met: {symbol} {tf}")
                 if should_alert_once_per_candle("ema_below", symbol, tf, candle_start):
                     send_telegram(
                         f"📉 PRICE BELOW EMA{ema_length}\n"
@@ -423,6 +413,8 @@ def process_indicators(symbol: str, tf: str, candle_start: int):
                         f"Distance: {dist:.2f}%\n"
                         f"Threshold: {below_percent}%"
                     )
+        else:
+            print(f"Not enough candles for EMA{ema_length}: {symbol} {tf} len={len(arr)}")
 
 
 # =========================
@@ -431,10 +423,12 @@ def process_indicators(symbol: str, tf: str, candle_start: int):
 def handle_kline(msg):
     try:
         if not isinstance(msg, dict):
+            print("WS skipped: message is not dict")
             return
 
         data_list = msg.get("data")
         if not isinstance(data_list, list):
+            print("WS skipped: no data list", msg)
             return
 
         with shortlist_lock:
@@ -445,18 +439,26 @@ def handle_kline(msg):
                 continue
 
             symbol = str(item.get("symbol", "")).upper()
-            interval = str(item.get("interval", ""))
+            interval = normalize_interval(item.get("interval", ""))
             close = safe_float(item.get("close"))
             start_time = item.get("start")
             confirm = bool(item.get("confirm", False))
 
+            print(
+                f"WS kline -> symbol={symbol} interval={interval} "
+                f"close={close} start={start_time} confirm={confirm}"
+            )
+
             if not symbol or not interval or close is None or start_time is None:
+                print("WS skipped: missing fields")
                 continue
 
             if symbol not in current_shortlist:
+                print(f"WS skipped: {symbol} not in shortlist")
                 continue
 
             if interval not in TIMEFRAMES:
+                print(f"WS skipped: interval {interval} not in TIMEFRAMES {TIMEFRAMES}")
                 continue
 
             ensure_symbol_state(symbol)
@@ -464,24 +466,28 @@ def handle_kline(msg):
             previous_start = current_candle_start[symbol].get(interval)
             new_candle_started = previous_start is None or start_time != previous_start
 
+            arr = data[symbol][interval]
+
             if new_candle_started:
                 current_candle_start[symbol][interval] = start_time
-                arr = data[symbol][interval]
                 arr.append(close)
 
                 if len(arr) > HISTORY_LIMIT:
                     arr.pop(0)
+
+                print(f"New candle started: {symbol} {interval} start={start_time}")
             else:
-                arr = data[symbol][interval]
                 if not arr:
                     arr.append(close)
                 else:
                     arr[-1] = close
 
+            # Real-time alerts, but only once per candle
             process_indicators(symbol, interval, int(start_time))
 
             if confirm:
                 last_closed_candle_start[symbol][interval] = start_time
+                print(f"Confirmed candle: {symbol} {interval} start={start_time}")
 
     except Exception as e:
         print("WebSocket handler error:", e)
@@ -500,6 +506,7 @@ def start_websocket_for_timeframe(tf: str):
         symbols = list(shortlist)
 
     if not symbols:
+        print(f"No symbols to subscribe for tf={tf}")
         return None
 
     for symbol in symbols:
@@ -559,12 +566,7 @@ def scan_loop():
                 time.sleep(5)
                 continue
 
-            top_1m = get_top_gainers_from_history("1", TOP_N)
-            top_5m = get_top_gainers_from_history("5", TOP_N)
             top_1h = get_top_gainers_from_history("60", TOP_N)
-
-            print("Top 1m gainers:", top_1m[:10])
-            print("Top 5m gainers:", top_5m[:10])
             print("Top 1h gainers:", top_1h[:10])
 
             time.sleep(30)
@@ -580,6 +582,7 @@ def scan_loop():
 def main():
     print("Starting scanner...")
     send_telegram("🚀 Scanner started")
+    send_telegram("✅ Telegram test message")
 
     threading.Thread(target=heartbeat, daemon=True).start()
     threading.Thread(target=shortlist_refresh_loop, daemon=True).start()
