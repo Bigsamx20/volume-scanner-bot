@@ -1,3 +1,4 @@
+
 import os
 import json
 import time
@@ -444,7 +445,6 @@ async def evaluate_live_candle(application, symbol: str, interval: str, live_can
             )
 
             try:
-                # mark as alerted BEFORE queueing, so the same candle is not queued repeatedly
                 alerted_candles.add(alert_key)
                 await enqueue_telegram_message(rule["chat_id"], msg)
 
@@ -453,7 +453,6 @@ async def evaluate_live_candle(application, symbol: str, interval: str, live_can
                     rule["id"], symbol, interval, side, spike_pct
                 )
             except Exception as e:
-                # remove key if queueing somehow fails
                 alerted_candles.discard(alert_key)
                 logger.warning("Failed queueing Telegram alert: %s", e)
 
@@ -505,9 +504,6 @@ async def websocket_worker(application, interval: str, symbols: List[str]) -> No
                     close_time = int(k["T"])
                     close_price = float(k["c"])
 
-                    # Spot websocket kline fields:
-                    # v = base asset volume
-                    # V = taker buy base asset volume
                     total_volume = float(k["v"])
                     taker_buy_base = float(k["V"])
 
@@ -525,8 +521,6 @@ async def websocket_worker(application, interval: str, symbols: List[str]) -> No
                     cache_key = (symbol, interval)
                     dq = candle_cache[cache_key]
 
-                    # If the last cached candle matches this open time, replace it.
-                    # Otherwise append the new current candle.
                     if dq and dq[-1]["open_time"] == open_time:
                         dq[-1] = live_candle
                     else:
@@ -544,7 +538,6 @@ async def websocket_worker(application, interval: str, symbols: List[str]) -> No
 async def restart_streams(application) -> None:
     global ws_tasks
 
-    # cancel old tasks
     for task in ws_tasks:
         task.cancel()
 
@@ -655,7 +648,6 @@ async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await reply_text_safe(update, "Please provide at least one symbol or use ALL_USDT.")
             return
 
-        # Optional quick validation against Binance symbol list
         valid_symbols = set(await fetch_all_usdt_symbols())
         invalid = [s for s in symbols if s not in valid_symbols]
         if invalid:
@@ -683,8 +675,6 @@ async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         ))
         await db.commit()
 
-        await restart_streams(context.application)
-
     scope_text = "ALL_USDT" if symbols_mode == "ALL_USDT" else symbol_input.upper()
     await reply_text_safe(
         update,
@@ -696,11 +686,8 @@ async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Symbols: {scope_text}\n"
         f"Mode: once per candle"
     )
-    )
 
-    await restart_streams(context.application)
-    
-    )
+    asyncio.create_task(restart_streams(context.application))
 
 async def list_rules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat is None:
@@ -750,17 +737,16 @@ async def delete_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await reply_text_safe(update, "Rule not found.")
         return
 
-    # Also remove old fired keys for this rule
     to_remove = {item for item in alerted_candles if item[0] == rule_id}
     if to_remove:
         alerted_candles.difference_update(to_remove)
 
-    await restart_streams(context.application)
     await reply_text_safe(update, f"Deleted rule {rule_id}.")
+    asyncio.create_task(restart_streams(context.application))
 
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await restart_streams(context.application)
-    await reply_text_safe(update, "Scanner reloaded.")
+    await reply_text_safe(update, "Scanner reloading...")
+    asyncio.create_task(restart_streams(context.application))
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled exception: %s", context.error)
@@ -772,7 +758,6 @@ async def maintenance_loop(application) -> None:
     while True:
         try:
             purge_old_alert_keys()
-            # refresh symbol universe periodically
             await fetch_all_usdt_symbols(force=False)
         except Exception as e:
             logger.warning("Maintenance loop error: %s", e)
