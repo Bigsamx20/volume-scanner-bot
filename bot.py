@@ -21,10 +21,12 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 BINANCE_REST = "https://api.binance.com"
 BINANCE_WS = "wss://stream.binance.com:9443/stream"
 
-# Prefer DB_FILE if explicitly set.
-# Otherwise use DB_DIR/scanner.db.
-# Default is ./data/scanner.db which works on most hosts.
-DEFAULT_DB_DIR = os.getenv("DB_DIR", "./data").strip()
+# Railway-safe defaults.
+# You can still override with env vars:
+#   DB_DIR=/app/data
+# or
+#   DB_FILE=/app/data/scanner.db
+DEFAULT_DB_DIR = os.getenv("DB_DIR", "/app/data").strip()
 DB_FILE = os.getenv("DB_FILE", os.path.join(DEFAULT_DB_DIR, "scanner.db")).strip()
 
 VALID_INTERVALS = {"5m", "1h"}
@@ -45,6 +47,9 @@ LEADERBOARD_DEBOUNCE_SECONDS = 12
 MIN_VOLUME_MULTIPLIER = 1.1
 BREAKOUT_LOOKBACK_CANDLES = 1
 MIN_24H_QUOTE_VOLUME_USDT = 20_000_000
+
+# Debug logging for why alerts do or do not trigger
+ENABLE_EVALUATION_DEBUG_LOGS = True
 
 INTERVAL_TO_SECONDS = {
     "5m": 5 * 60,
@@ -110,6 +115,9 @@ def ensure_db_path() -> str:
     db_path = Path(DB_FILE).expanduser()
     db_dir = db_path.parent
 
+    logger.info("DB_FILE raw value: %s", DB_FILE)
+    logger.info("Resolved DB directory: %s", db_dir)
+
     db_dir.mkdir(parents=True, exist_ok=True)
 
     test_file = db_dir / ".write_test"
@@ -118,15 +126,20 @@ def ensure_db_path() -> str:
             f.write("ok")
         test_file.unlink(missing_ok=True)
     except Exception as e:
+        logger.exception("Database directory write test failed")
         raise RuntimeError(
             f"Database directory is not writable: {db_dir}. "
-            f"Set DB_FILE or DB_DIR to a writable location. Original error: {e}"
+            f"Set DB_DIR or DB_FILE to a writable path. Original error: {e}"
         ) from e
 
-    return str(db_path.resolve())
+    resolved = str(db_path.resolve())
+    logger.info("Resolved DB file: %s", resolved)
+    return resolved
 
 async def connect_db() -> aiosqlite.Connection:
     db_path = ensure_db_path()
+    logger.info("Connecting to SQLite DB: %s", db_path)
+
     db = await aiosqlite.connect(db_path, timeout=30)
     await db.execute("PRAGMA journal_mode=WAL;")
     await db.execute("PRAGMA synchronous=NORMAL;")
@@ -134,10 +147,17 @@ async def connect_db() -> aiosqlite.Connection:
     return db
 
 async def init_db() -> None:
-    async with await connect_db() as db:
-        await db.execute(CREATE_RULES_SQL)
-        await db.commit()
-    logger.info("Database initialized at %s", ensure_db_path())
+    try:
+        db = await connect_db()
+        try:
+            await db.execute(CREATE_RULES_SQL)
+            await db.commit()
+            logger.info("Database initialized successfully.")
+        finally:
+            await db.close()
+    except Exception:
+        logger.exception("init_db failed")
+        raise
 
 async def get_all_rules() -> List[dict]:
     async with await connect_db() as db:
@@ -396,7 +416,7 @@ async def fetch_top_active_usdt_symbols(force: bool = False, limit: int = TOP_AC
 
     top_active_usdt_symbols_cache = top_symbols
     top_active_usdt_symbols_last_refresh = now
-    logger.info("Loaded top %d active USDT symbols", len(top_symbols))
+    logger.info("Loaded top %d active USDT symbols: %s", len(top_symbols), ", ".join(top_symbols))
     return top_symbols
 
 async def fetch_klines(symbol: str, interval: str, limit: int) -> List[list]:
@@ -422,6 +442,7 @@ async def preload_symbol_history(symbol: str, interval: str, needed_closed_candl
         dq = candle_cache[key]
         dq.clear()
         dq.extend(parsed)
+        logger.info("Preloaded %s %s history: %d candles", symbol, interval, len(dq))
     except Exception as e:
         logger.warning("Preload failed for %s %s: %s", symbol, interval, e)
 
@@ -441,6 +462,7 @@ async def rebuild_tracking_map() -> None:
     tracked_symbols_by_interval.clear()
     rules = await get_all_rules()
     if not rules:
+        logger.info("No enabled rules found in database.")
         return
 
     await fetch_all_usdt_symbols(force=False)
@@ -451,16 +473,31 @@ async def rebuild_tracking_map() -> None:
     for rule in rules:
         interval = rule["interval"]
         if interval not in VALID_INTERVALS:
+            logger.warning("Skipping rule %s due to invalid interval %s", rule["id"], interval)
             continue
 
         max_needed_per_interval[interval] = max(max_needed_per_interval[interval], rule["baseline_candles"])
         symbols = await resolve_rule_symbols(rule)
+
+        logger.info(
+            "Rule %s loaded | chat=%s | interval=%s | side=%s | threshold=%.3f | baseline=%d | mode=%s | symbols=%d",
+            rule["id"],
+            rule["chat_id"],
+            rule["interval"],
+            rule["side"],
+            rule["threshold_percent"],
+            rule["baseline_candles"],
+            rule["symbols_mode"],
+            len(symbols),
+        )
+
         for sym in symbols:
             tracked_symbols_by_interval[interval].add(sym)
 
     preload_tasks = []
     for interval, symbols in tracked_symbols_by_interval.items():
         needed = max_needed_per_interval[interval]
+        logger.info("Tracking interval %s with %d symbols", interval, len(symbols))
         for sym in symbols:
             preload_tasks.append(preload_symbol_history(sym, interval, needed))
 
@@ -515,6 +552,10 @@ def add_leaderboard_candidate(
             "elapsed": human_elapsed_in_candle(current["open_time"], interval),
             "chart": tradingview_link(symbol),
         }
+        logger.info(
+            "Candidate added | rule=%s | symbol=%s | interval=%s | pct=%.3f | vol_mult=%.3f",
+            rule["id"], symbol, interval, price_pct, vol_mult
+        )
 
 async def leaderboard_dispatcher_loop(application) -> None:
     logger.info("Leaderboard dispatcher loop started.")
@@ -566,8 +607,8 @@ async def leaderboard_dispatcher_loop(application) -> None:
                 pending_leaderboards.pop(bucket_key, None)
 
                 logger.info(
-                    "Leaderboard queued | rule=%s interval=%s entries=%d",
-                    bucket["rule_id"], bucket["interval"], len(top_candidates)
+                    "Leaderboard queued | rule=%s | interval=%s | entries=%d | chat_id=%s",
+                    bucket["rule_id"], bucket["interval"], len(top_candidates), bucket["chat_id"]
                 )
 
             await asyncio.sleep(5)
@@ -604,7 +645,7 @@ def purge_old_alert_state() -> None:
 # ============================================================
 # ALERT EVALUATION
 # ============================================================
-async def evaluate_live_candle(application, symbol: str, interval: str, live_candle: dict) -> None:
+async def evaluate_live_candle(symbol: str, interval: str) -> None:
     rules = await get_all_rules()
     if not rules:
         return
@@ -614,7 +655,8 @@ async def evaluate_live_candle(application, symbol: str, interval: str, live_can
             continue
 
         if rule["symbols_mode"] == "CUSTOM":
-            if symbol not in [s.upper() for s in rule["symbols"]]:
+            allowed_symbols = {s.upper() for s in rule["symbols"]}
+            if symbol not in allowed_symbols:
                 continue
 
         side = rule["side"]
@@ -625,6 +667,15 @@ async def evaluate_live_candle(application, symbol: str, interval: str, live_can
         candles = list(candle_cache[key])
 
         if len(candles) < baseline_candles + BREAKOUT_LOOKBACK_CANDLES + 1:
+            if ENABLE_EVALUATION_DEBUG_LOGS:
+                logger.info(
+                    "SKIP %s %s | rule=%s | reason=not_enough_candles | have=%d | need=%d",
+                    symbol,
+                    interval,
+                    rule["id"],
+                    len(candles),
+                    baseline_candles + BREAKOUT_LOOKBACK_CANDLES + 1,
+                )
             continue
 
         current = candles[-1]
@@ -633,10 +684,14 @@ async def evaluate_live_candle(application, symbol: str, interval: str, live_can
 
         pct = price_change_percent(current)
         if pct is None:
+            if ENABLE_EVALUATION_DEBUG_LOGS:
+                logger.info("SKIP %s %s | rule=%s | reason=pct_none", symbol, interval, rule["id"])
             continue
 
         vol_mult, avg_total_volume = volume_multiplier(current["total"], historical_totals)
         if vol_mult is None or avg_total_volume is None:
+            if ENABLE_EVALUATION_DEBUG_LOGS:
+                logger.info("SKIP %s %s | rule=%s | reason=vol_mult_none", symbol, interval, rule["id"])
             continue
 
         breakout_ok = breakout_confirmed(side, current, previous, BREAKOUT_LOOKBACK_CANDLES)
@@ -646,7 +701,26 @@ async def evaluate_live_candle(application, symbol: str, interval: str, live_can
         else:
             direction_ok = pct <= -min_price_move
 
+        if ENABLE_EVALUATION_DEBUG_LOGS:
+            logger.info(
+                "CHECK %s %s | rule=%s | side=%s | pct=%.3f | min=%.3f | vol_mult=%.3f | breakout=%s | total=%.3f | avg=%.3f",
+                symbol,
+                interval,
+                rule["id"],
+                side,
+                pct,
+                min_price_move,
+                vol_mult,
+                breakout_ok,
+                current["total"],
+                avg_total_volume,
+            )
+
         if direction_ok and vol_mult >= MIN_VOLUME_MULTIPLIER and breakout_ok:
+            logger.info(
+                "MATCH %s %s | rule=%s | pct=%.3f | vol_mult=%.3f | breakout=%s",
+                symbol, interval, rule["id"], pct, vol_mult, breakout_ok
+            )
             add_leaderboard_candidate(
                 rule=rule,
                 symbol=symbol,
@@ -660,7 +734,7 @@ async def evaluate_live_candle(application, symbol: str, interval: str, live_can
 # ============================================================
 # WEBSOCKET STREAMS
 # ============================================================
-async def websocket_worker(application, interval: str, symbols: List[str]) -> None:
+async def websocket_worker(interval: str, symbols: List[str]) -> None:
     if not symbols:
         return
 
@@ -684,36 +758,31 @@ async def websocket_worker(application, interval: str, symbols: List[str]) -> No
                         continue
 
                     symbol = k["s"]
-                    open_time = int(k["t"])
-                    close_time = int(k["T"])
 
                     total_volume = float(k["v"])
                     taker_buy_base = float(k["V"])
 
-                    buy_volume = taker_buy_base
-                    sell_volume = max(total_volume - taker_buy_base, 0.0)
-
                     live_candle = {
-                        "open_time": open_time,
-                        "close_time": close_time,
+                        "open_time": int(k["t"]),
+                        "close_time": int(k["T"]),
                         "open": float(k["o"]),
                         "high": float(k["h"]),
                         "low": float(k["l"]),
                         "close": float(k["c"]),
-                        "buy": buy_volume,
-                        "sell": sell_volume,
+                        "buy": taker_buy_base,
+                        "sell": max(total_volume - taker_buy_base, 0.0),
                         "total": total_volume,
                     }
 
                     cache_key = (symbol, interval)
                     dq = candle_cache[cache_key]
 
-                    if dq and dq[-1]["open_time"] == open_time:
+                    if dq and dq[-1]["open_time"] == live_candle["open_time"]:
                         dq[-1] = live_candle
                     else:
                         dq.append(live_candle)
 
-                    await evaluate_live_candle(application, symbol, interval, live_candle)
+                    await evaluate_live_candle(symbol, interval)
 
         except asyncio.CancelledError:
             logger.info("WS cancelled | interval=%s | symbols=%d", interval, len(symbols))
@@ -722,7 +791,7 @@ async def websocket_worker(application, interval: str, symbols: List[str]) -> No
             logger.warning("WS reconnecting | interval=%s | err=%s", interval, e)
             await asyncio.sleep(5)
 
-async def restart_streams(application) -> None:
+async def restart_streams() -> None:
     global ws_tasks
 
     async with restart_lock:
@@ -743,7 +812,7 @@ async def restart_streams(application) -> None:
         for interval, symbols_set in tracked_symbols_by_interval.items():
             symbols = sorted(symbols_set)
             for group in chunked(symbols, STREAM_CHUNK_SIZE):
-                task = asyncio.create_task(websocket_worker(application, interval, group))
+                task = asyncio.create_task(websocket_worker(interval, group))
                 ws_tasks.append(task)
 
         logger.info("Started %d websocket task(s)", len(ws_tasks))
@@ -900,7 +969,7 @@ async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Filters: volume >= {MIN_VOLUME_MULTIPLIER:.2f}x + breakout/breakdown confirmation"
     )
 
-    asyncio.create_task(restart_streams(context.application))
+    asyncio.create_task(restart_streams())
 
 async def list_rules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat is None:
@@ -964,11 +1033,11 @@ async def delete_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         sent_leaderboards.difference_update(sent_to_remove)
 
     await reply_text_safe(update, f"Deleted rule {rule_id}.")
-    asyncio.create_task(restart_streams(context.application))
+    asyncio.create_task(restart_streams())
 
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await reply_text_safe(update, "Scanner reloading...")
-    asyncio.create_task(restart_streams(context.application))
+    asyncio.create_task(restart_streams())
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled exception: %s", context.error)
@@ -976,7 +1045,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # ============================================================
 # BACKGROUND MAINTENANCE
 # ============================================================
-async def maintenance_loop(application) -> None:
+async def maintenance_loop() -> None:
     while True:
         try:
             purge_old_alert_state()
@@ -987,7 +1056,7 @@ async def maintenance_loop(application) -> None:
                 new_top = await fetch_top_active_usdt_symbols(force=True)
                 if old_top and new_top != old_top:
                     logger.info("Top active symbol list changed. Restarting streams.")
-                    asyncio.create_task(restart_streams(application))
+                    asyncio.create_task(restart_streams())
             else:
                 await fetch_top_active_usdt_symbols(force=False)
 
@@ -1014,11 +1083,11 @@ async def post_init(application) -> None:
         await asyncio.sleep(5)
         await fetch_all_usdt_symbols(force=True)
         await fetch_top_active_usdt_symbols(force=True)
-        await restart_streams(application)
+        await restart_streams()
         logger.info("Scanner started after delay.")
 
     delayed_start_task = asyncio.create_task(delayed_start())
-    maintenance_task = asyncio.create_task(maintenance_loop(application))
+    maintenance_task = asyncio.create_task(maintenance_loop())
     logger.info("Bot initialized.")
 
 async def cleanup_background_tasks() -> None:
@@ -1056,7 +1125,8 @@ def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("Please set TELEGRAM_BOT_TOKEN in your environment first.")
 
-    logger.info("Starting bot with DB file: %s", ensure_db_path())
+    logger.info("Starting bot. DB_FILE=%s", DB_FILE)
+    logger.info("Writable DB path resolved to: %s", ensure_db_path())
 
     application = (
         ApplicationBuilder()
