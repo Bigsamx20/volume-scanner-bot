@@ -20,7 +20,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 BINANCE_REST = "https://api.binance.com"
 BINANCE_WS = "wss://stream.binance.com:9443/stream"
 
-DB_FILE = "scanner.db"
+DB_FILE = "/data/scanner.db"
 
 VALID_INTERVALS = {"5m", "1h"}
 DEFAULT_BASELINE_CANDLES = 10
