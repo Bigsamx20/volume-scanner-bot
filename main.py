@@ -5,155 +5,88 @@ import requests
 from pybit.unified_trading import HTTP, WebSocket
 
 # =========================
-# BASIC CONFIG
+# CONFIG
 # =========================
-SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT").split(",") if s.strip()]
-TIMEFRAMES = [tf.strip() for tf in os.getenv("TIMEFRAMES", "1,5,60").split(",") if tf.strip()]
-
 TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "300"))
-HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "300"))
-ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", "900"))
+TOP_N = int(os.getenv("TOP_N", "30"))  # top gainers to track
+HISTORY_LIMIT = 300
+ALERT_COOLDOWN = 600
 
-# Set to true if you want BOT ALIVE messages on Telegram
-HEARTBEAT_TO_TELEGRAM = os.getenv("HEARTBEAT_TO_TELEGRAM", "true").lower() == "true"
+# indicator settings (global)
+RSI_LENGTH = 14
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
 
-# =========================
-# SETTINGS FOR ALL SYMBOLS
-# Edit only this block
-# =========================
-TIMEFRAME_SETTINGS = {
-    "1": {
-        "rsi": {
-            "enabled": True,
-            "length": 14,
-            "overbought": 70,
-            "oversold": 30,
-        },
-        "ema_distance": {
-            "enabled": True,
-            "ema_length": 200,
-            "above_percent": 2.0,
-            "below_percent": -2.0,
-        },
-    },
-    "5": {
-        "rsi": {
-            "enabled": True,
-            "length": 14,
-            "overbought": 72,
-            "oversold": 28,
-        },
-        "ema_distance": {
-            "enabled": True,
-            "ema_length": 200,
-            "above_percent": 4.0,
-            "below_percent": -4.0,
-        },
-    },
-    "60": {
-        "rsi": {
-            "enabled": True,
-            "length": 14,
-            "overbought": 75,
-            "oversold": 25,
-        },
-        "ema_distance": {
-            "enabled": True,
-            "ema_length": 200,
-            "above_percent": 20.0,
-            "below_percent": -20.0,
-        },
-    },
-}
+EMA_LENGTH = 200
+EMA_THRESHOLD = 5.0  # % distance
 
-# =========================
-# GLOBAL STATE
 # =========================
 data = {}
-session = None
 last_alert_time = {}
-
+session = HTTP(testnet=False)
 
 # =========================
 # TELEGRAM
 # =========================
-def send_telegram(message: str):
+def send_telegram(msg):
     if not TELEGRAM_ENABLED:
-        return
-
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Telegram config missing")
         return
 
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        response = requests.post(
-            url,
-            json={"chat_id": CHAT_ID, "text": message},
-            timeout=10,
-        )
-        print("Telegram status:", response.status_code)
-        print("Telegram response:", response.text)
+        requests.post(url, json={"chat_id": CHAT_ID, "text": msg}, timeout=10)
     except Exception as e:
         print("Telegram error:", e)
 
 
 # =========================
-# ALERT COOLDOWN
-# =========================
-def can_alert(key: str) -> bool:
+def can_alert(key):
     now = time.time()
     last = last_alert_time.get(key, 0)
 
     if now - last >= ALERT_COOLDOWN:
         last_alert_time[key] = now
         return True
-
     return False
 
 
 # =========================
-# HEARTBEAT
+# GET ALL SYMBOLS
 # =========================
-def heartbeat():
-    while True:
-        print("BOT ALIVE ✅")
-        if HEARTBEAT_TO_TELEGRAM:
-            send_telegram("BOT ALIVE ✅")
-        time.sleep(HEARTBEAT_SECONDS)
+def get_symbols():
+    res = session.get_instruments_info(category="linear")
+    symbols = []
+
+    for item in res["result"]["list"]:
+        symbols.append(item["symbol"])
+
+    print(f"Loaded {len(symbols)} symbols")
+    return symbols
 
 
 # =========================
-# STATE INIT
+# EMA
 # =========================
-def init_state():
-    for symbol in SYMBOLS:
-        data[symbol] = {}
-        for tf in TIMEFRAMES:
-            data[symbol][tf] = []
-
-
-# =========================
-# INDICATORS
-# =========================
-def ema(values, length=200):
+def ema(values, length):
     if len(values) < length:
         return None
 
-    multiplier = 2 / (length + 1)
-    ema_value = sum(values[:length]) / length
+    k = 2 / (length + 1)
+    ema_val = sum(values[:length]) / length
 
-    for value in values[length:]:
-        ema_value = ((value - ema_value) * multiplier) + ema_value
+    for v in values[length:]:
+        ema_val = v * k + ema_val * (1 - k)
 
-    return ema_value
+    return ema_val
 
 
-def rsi(values, length=14):
+# =========================
+# RSI
+# =========================
+def rsi(values, length):
     if len(values) < length + 1:
         return None
 
@@ -173,219 +106,125 @@ def rsi(values, length=14):
         avg_loss = ((avg_loss * (length - 1)) + losses[i]) / length
 
     if avg_loss == 0:
-        return 100.0
+        return 100
 
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 
 # =========================
-# SETTINGS HELPERS
+# FETCH HISTORY
 # =========================
-def get_tf_settings(tf: str) -> dict:
-    return TIMEFRAME_SETTINGS.get(tf, {})
-
-
-# =========================
-# HISTORY LOADING
-# =========================
-def fetch_history(symbol: str, tf: str):
+def fetch_history(symbol, tf):
     try:
-        response = session.get_kline(
+        res = session.get_kline(
             category="linear",
             symbol=symbol,
             interval=tf,
             limit=HISTORY_LIMIT
         )
 
-        rows = response.get("result", {}).get("list", [])
-        if not rows:
-            print(f"No history found for {symbol} {tf}")
-            return
+        rows = res["result"]["list"]
+        rows.reverse()
 
-        rows.reverse()  # oldest -> newest
-        closes = []
+        closes = [float(r[4]) for r in rows]
 
-        for row in rows:
-            try:
-                closes.append(float(row[4]))
-            except (TypeError, ValueError, IndexError):
-                continue
+        if symbol not in data:
+            data[symbol] = {}
 
         data[symbol][tf] = closes
-        print(f"Loaded history: {symbol} {tf} ({len(closes)} candles)")
 
-        if closes:
-            process_indicators(symbol, tf, closes[-1], source="history")
-
-    except Exception as e:
-        print(f"History fetch error {symbol} {tf}: {e}")
+    except:
+        pass
 
 
 # =========================
-# INDICATOR PROCESSING
+# TOP GAINERS
 # =========================
-def process_indicators(symbol: str, tf: str, close: float, source="live"):
+def get_top_gainers(tf):
+    changes = []
+
+    for symbol in data:
+        arr = data[symbol].get(tf, [])
+        if len(arr) < 2:
+            continue
+
+        change = (arr[-1] - arr[-2]) / arr[-2] * 100
+        changes.append((symbol, change))
+
+    changes.sort(key=lambda x: x[1], reverse=True)
+
+    return [s[0] for s in changes[:TOP_N]]
+
+
+# =========================
+# PROCESS SIGNALS
+# =========================
+def process(symbol, tf):
     arr = data[symbol][tf]
-    cfg = get_tf_settings(tf)
+    close = arr[-1]
 
-    rsi_cfg = cfg.get("rsi", {})
-    ema_cfg = cfg.get("ema_distance", {})
+    # RSI
+    r = rsi(arr, RSI_LENGTH)
+    if r:
+        if r >= RSI_OVERBOUGHT:
+            key = f"rsi_high_{symbol}_{tf}"
+            if can_alert(key):
+                send_telegram(f"🚨 RSI HIGH {symbol} {tf} = {r:.2f}")
 
-    # ---------- RSI ----------
-    if rsi_cfg.get("enabled", False):
-        rsi_length = int(rsi_cfg.get("length", 14))
-        r = rsi(arr, rsi_length)
+        if r <= RSI_OVERSOLD:
+            key = f"rsi_low_{symbol}_{tf}"
+            if can_alert(key):
+                send_telegram(f"🚨 RSI LOW {symbol} {tf} = {r:.2f}")
 
-        if r is not None:
-            print(f"{symbol} {tf} RSI: {r:.2f} ({source})")
+    # EMA
+    e = ema(arr, EMA_LENGTH)
+    if e:
+        dist = (close - e) / e * 100
 
-            overbought = float(rsi_cfg.get("overbought", 70))
-            oversold = float(rsi_cfg.get("oversold", 30))
+        if dist >= EMA_THRESHOLD:
+            key = f"ema_up_{symbol}_{tf}"
+            if can_alert(key):
+                send_telegram(f"📈 {symbol} {tf} +{dist:.2f}% above EMA")
 
-            if r >= overbought:
-                key = f"rsi_overbought:{symbol}:{tf}"
-                if can_alert(key):
-                    send_telegram(
-                        f"🚨 RSI OVERBOUGHT\n"
-                        f"Symbol: {symbol}\n"
-                        f"Timeframe: {tf}\n"
-                        f"RSI: {r:.2f}\n"
-                        f"Threshold: {overbought}"
-                    )
-
-            if r <= oversold:
-                key = f"rsi_oversold:{symbol}:{tf}"
-                if can_alert(key):
-                    send_telegram(
-                        f"🚨 RSI OVERSOLD\n"
-                        f"Symbol: {symbol}\n"
-                        f"Timeframe: {tf}\n"
-                        f"RSI: {r:.2f}\n"
-                        f"Threshold: {oversold}"
-                    )
-
-    # ---------- EMA DISTANCE ----------
-    if ema_cfg.get("enabled", False):
-        ema_length = int(ema_cfg.get("ema_length", 200))
-        ema_value = ema(arr, ema_length)
-
-        if ema_value is not None:
-            dist = ((close - ema_value) / ema_value) * 100
-            print(f"{symbol} {tf} EMA{ema_length} DIST: {dist:.2f}% ({source})")
-
-            above_percent = float(ema_cfg.get("above_percent", 2.0))
-            below_percent = float(ema_cfg.get("below_percent", -2.0))
-
-            if dist >= above_percent:
-                key = f"ema_above:{symbol}:{tf}"
-                if can_alert(key):
-                    send_telegram(
-                        f"📈 PRICE ABOVE EMA{ema_length}\n"
-                        f"Symbol: {symbol}\n"
-                        f"Timeframe: {tf}\n"
-                        f"Distance: {dist:.2f}%\n"
-                        f"Threshold: {above_percent}%"
-                    )
-
-            if dist <= below_percent:
-                key = f"ema_below:{symbol}:{tf}"
-                if can_alert(key):
-                    send_telegram(
-                        f"📉 PRICE BELOW EMA{ema_length}\n"
-                        f"Symbol: {symbol}\n"
-                        f"Timeframe: {tf}\n"
-                        f"Distance: {dist:.2f}%\n"
-                        f"Threshold: {below_percent}%"
-                    )
+        if dist <= -EMA_THRESHOLD:
+            key = f"ema_down_{symbol}_{tf}"
+            if can_alert(key):
+                send_telegram(f"📉 {symbol} {tf} {dist:.2f}% below EMA")
 
 
 # =========================
-# WEBSOCKET HANDLER
+# MAIN LOOP
 # =========================
-def handle(msg):
-    try:
-        if not isinstance(msg, dict):
-            return
+def run_scanner():
+    symbols = get_symbols()
 
-        if "data" not in msg:
-            return
+    print("Loading history...")
 
-        data_list = msg["data"]
-        if not isinstance(data_list, list):
-            return
+    for s in symbols:
+        for tf in ["1", "5", "60"]:
+            fetch_history(s, tf)
 
-        for item in data_list:
-            if not isinstance(item, dict):
-                continue
-
-            required_keys = ["symbol", "interval", "close", "confirm"]
-            if not all(key in item for key in required_keys):
-                continue
-
-            symbol = str(item["symbol"]).upper()
-            tf = str(item["interval"])
-            confirm = bool(item["confirm"])
-
-            try:
-                close = float(item["close"])
-            except (TypeError, ValueError):
-                continue
-
-            if symbol not in data or tf not in data[symbol]:
-                continue
-
-            if not confirm:
-                continue
-
-            arr = data[symbol][tf]
-            arr.append(close)
-
-            if len(arr) > HISTORY_LIMIT:
-                arr.pop(0)
-
-            process_indicators(symbol, tf, close, source="live")
-
-    except Exception as e:
-        print("Handler error:", e)
-
-
-# =========================
-# MAIN
-# =========================
-def main():
-    global session
-
-    init_state()
-
-    print("Starting bot...")
-    send_telegram("🚀 Bot started")
-
-    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
-    heartbeat_thread.start()
-
-    session = HTTP(testnet=False)
-
-    for symbol in SYMBOLS:
-        for tf in TIMEFRAMES:
-            fetch_history(symbol, tf)
-
-    ws = WebSocket(testnet=False, channel_type="linear")
-
-    for symbol in SYMBOLS:
-        for tf in TIMEFRAMES:
-            ws.kline_stream(
-                interval=int(tf),
-                symbol=symbol,
-                callback=handle
-            )
-            print(f"Subscribed: {symbol} {tf}")
-
-    print("Bot is running...")
+    print("Scanner started")
+    send_telegram("🚀 Scanner started")
 
     while True:
-        time.sleep(1)
+        try:
+            for tf in ["1", "5", "60"]:
+                top = get_top_gainers(tf)
+
+                print(f"Top {TOP_N} gainers {tf}m:", top[:5])
+
+                for s in top:
+                    process(s, tf)
+
+            time.sleep(30)
+
+        except Exception as e:
+            print("scanner error:", e)
+            time.sleep(5)
 
 
+# =========================
 if __name__ == "__main__":
-    main()
+    run_scanner()
