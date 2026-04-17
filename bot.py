@@ -27,9 +27,14 @@ DEFAULT_BASELINE_CANDLES = 20
 STREAM_CHUNK_SIZE = 120
 MAX_CANDLE_HISTORY = 300
 SYMBOL_REFRESH_SECONDS = 3600
+TOP_ACTIVE_REFRESH_SECONDS = 300
 
 MIN_TELEGRAM_SEND_DELAY_SECONDS = 1.2
 MAX_TELEGRAM_RETRIES = 5
+
+TOP_ACTIVE_SYMBOL_COUNT = 20
+TOP_ALERTS_PER_MESSAGE = 5
+LEADERBOARD_DEBOUNCE_SECONDS = 15
 
 INTERVAL_TO_SECONDS = {
     "5m": 5 * 60,
@@ -49,20 +54,32 @@ logger = logging.getLogger("volume_scanner_bot")
 # GLOBAL STATE
 # ============================================================
 candle_cache: Dict[Tuple[str, str], deque] = defaultdict(lambda: deque(maxlen=MAX_CANDLE_HISTORY))
-alerted_candles: Set[Tuple[int, str, str, int]] = set()
 
 ws_tasks: List[asyncio.Task] = []
 maintenance_task: Optional[asyncio.Task] = None
 telegram_sender_task: Optional[asyncio.Task] = None
+leaderboard_dispatcher_task: Optional[asyncio.Task] = None
 
 tracked_symbols_by_interval: Dict[str, Set[str]] = defaultdict(set)
 
 all_usdt_symbols_cache: List[str] = []
 all_usdt_symbols_last_refresh = 0
 
+top_active_usdt_symbols_cache: List[str] = []
+top_active_usdt_symbols_last_refresh = 0
+
 shared_http_session: Optional[aiohttp.ClientSession] = None
 
 telegram_send_queue: "asyncio.Queue[Tuple[int, str]]" = asyncio.Queue()
+
+# pending leaderboards:
+# key = (rule_id, interval, candle_open_time)
+pending_leaderboards: Dict[Tuple[int, str, int], dict] = {}
+
+# once sent for a candle/rule, do not send again
+sent_leaderboards: Set[Tuple[int, str, int]] = set()
+
+restart_lock = asyncio.Lock()
 
 # ============================================================
 # DATABASE
@@ -182,6 +199,9 @@ async def ensure_http_session() -> aiohttp.ClientSession:
         shared_http_session = aiohttp.ClientSession()
     return shared_http_session
 
+def tradingview_link(symbol: str) -> str:
+    return f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"
+
 # ============================================================
 # TELEGRAM SEND QUEUE / RATE LIMIT PROTECTION
 # ============================================================
@@ -200,7 +220,7 @@ async def telegram_sender_loop(application) -> None:
             while not sent and attempt < MAX_TELEGRAM_RETRIES:
                 attempt += 1
                 try:
-                    await application.bot.send_message(chat_id=chat_id, text=text)
+                    await application.bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
                     sent = True
                     logger.info("Telegram alert sent to chat_id=%s", chat_id)
                     await asyncio.sleep(MIN_TELEGRAM_SEND_DELAY_SECONDS)
@@ -248,12 +268,12 @@ async def reply_text_safe(update: Update, text: str) -> None:
         return
 
     try:
-        await update.message.reply_text(text)
+        await update.message.reply_text(text, disable_web_page_preview=True)
     except RetryAfter as e:
         retry_after = int(getattr(e, "retry_after", 5))
         logger.warning("Direct reply rate-limited. Waiting %s seconds.", retry_after)
         await asyncio.sleep(retry_after + 1)
-        await update.message.reply_text(text)
+        await update.message.reply_text(text, disable_web_page_preview=True)
     except Exception as e:
         logger.warning("Failed sending direct reply: %s", e)
 
@@ -287,6 +307,38 @@ async def fetch_all_usdt_symbols(force: bool = False) -> List[str]:
     logger.info("Loaded %d USDT spot symbols", len(symbols))
     return symbols
 
+async def fetch_top_active_usdt_symbols(force: bool = False, limit: int = TOP_ACTIVE_SYMBOL_COUNT) -> List[str]:
+    global top_active_usdt_symbols_cache, top_active_usdt_symbols_last_refresh
+
+    now = time.time()
+    if (not force) and top_active_usdt_symbols_cache and (now - top_active_usdt_symbols_last_refresh < TOP_ACTIVE_REFRESH_SECONDS):
+        return top_active_usdt_symbols_cache[:limit]
+
+    valid_symbols = set(await fetch_all_usdt_symbols(force=False))
+    session = await ensure_http_session()
+
+    async with session.get(f"{BINANCE_REST}/api/v3/ticker/24hr") as resp:
+        resp.raise_for_status()
+        data = await resp.json()
+
+    ranked = []
+    for row in data:
+        symbol = row.get("symbol")
+        if symbol in valid_symbols:
+            try:
+                quote_volume = float(row.get("quoteVolume", 0.0))
+            except (TypeError, ValueError):
+                quote_volume = 0.0
+            ranked.append((symbol, quote_volume))
+
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    top_symbols = [symbol for symbol, _ in ranked[:limit]]
+
+    top_active_usdt_symbols_cache = top_symbols
+    top_active_usdt_symbols_last_refresh = now
+    logger.info("Loaded top %d active USDT symbols", len(top_symbols))
+    return top_symbols
+
 async def fetch_klines(symbol: str, interval: str, limit: int) -> List[list]:
     session = await ensure_http_session()
     params = {
@@ -319,8 +371,12 @@ async def preload_symbol_history(symbol: str, interval: str, needed_closed_candl
 # ============================================================
 async def resolve_rule_symbols(rule: dict) -> List[str]:
     if rule["symbols_mode"] == "ALL_USDT":
-        return await fetch_all_usdt_symbols()
+        return await fetch_top_active_usdt_symbols()
     return [s.upper() for s in rule["symbols"]]
+
+async def has_dynamic_top20_rules() -> bool:
+    rules = await get_all_rules()
+    return any(rule["symbols_mode"] == "ALL_USDT" for rule in rules)
 
 async def rebuild_tracking_map() -> None:
     tracked_symbols_by_interval.clear()
@@ -328,7 +384,8 @@ async def rebuild_tracking_map() -> None:
     if not rules:
         return
 
-    await fetch_all_usdt_symbols()
+    await fetch_all_usdt_symbols(force=False)
+    await fetch_top_active_usdt_symbols(force=False)
 
     max_needed_per_interval: Dict[str, int] = defaultdict(lambda: DEFAULT_BASELINE_CANDLES)
 
@@ -351,6 +408,130 @@ async def rebuild_tracking_map() -> None:
     if preload_tasks:
         for batch in chunked(preload_tasks, 150):
             await asyncio.gather(*batch, return_exceptions=True)
+
+# ============================================================
+# LEADERBOARD ALERTS
+# ============================================================
+def add_leaderboard_candidate(
+    rule: dict,
+    symbol: str,
+    interval: str,
+    current: dict,
+    avg_value: float,
+    spike_pct: float,
+) -> None:
+    bucket_key = (rule["id"], interval, current["open_time"])
+
+    if bucket_key in sent_leaderboards:
+        return
+
+    bucket = pending_leaderboards.get(bucket_key)
+    if bucket is None:
+        bucket = {
+            "rule_id": rule["id"],
+            "chat_id": rule["chat_id"],
+            "interval": interval,
+            "side": rule["side"],
+            "threshold": rule["threshold_percent"],
+            "baseline_candles": rule["baseline_candles"],
+            "candle_open_time": current["open_time"],
+            "created_at": time.time(),
+            "candidates": {},
+        }
+        pending_leaderboards[bucket_key] = bucket
+
+    existing = bucket["candidates"].get(symbol)
+    if existing is None or spike_pct > existing["spike_pct"]:
+        bucket["candidates"][symbol] = {
+            "symbol": symbol,
+            "spike_pct": spike_pct,
+            "current_value": current[rule["side"]],
+            "avg_value": avg_value,
+            "close": current["close"],
+            "elapsed": human_elapsed_in_candle(current["open_time"], interval),
+            "chart": tradingview_link(symbol),
+        }
+
+async def leaderboard_dispatcher_loop(application) -> None:
+    logger.info("Leaderboard dispatcher loop started.")
+    while True:
+        try:
+            now = time.time()
+            to_send = []
+
+            for bucket_key, bucket in list(pending_leaderboards.items()):
+                age = now - bucket["created_at"]
+                if age >= LEADERBOARD_DEBOUNCE_SECONDS and bucket["candidates"]:
+                    to_send.append((bucket_key, bucket))
+
+            for bucket_key, bucket in to_send:
+                candidates = list(bucket["candidates"].values())
+                candidates.sort(key=lambda x: x["spike_pct"], reverse=True)
+                top_candidates = candidates[:TOP_ALERTS_PER_MESSAGE]
+
+                if not top_candidates:
+                    pending_leaderboards.pop(bucket_key, None)
+                    continue
+
+                header = (
+                    f"🔥 TOP {len(top_candidates)} {bucket['side'].upper()} VOLUME SPIKES ({bucket['interval']})\n\n"
+                    f"Threshold: {bucket['threshold']:.2f}%\n"
+                    f"Baseline: last {bucket['baseline_candles']} candles\n"
+                    f"Universe: top {TOP_ACTIVE_SYMBOL_COUNT} active USDT symbols or your custom list\n"
+                )
+
+                lines = []
+                for idx, item in enumerate(top_candidates, start=1):
+                    lines.append(
+                        f"\n{idx}. {item['symbol']}  +{item['spike_pct']:.2f}%\n"
+                        f"Live {bucket['side']} vol: {item['current_value']:,.6f}\n"
+                        f"Avg {bucket['side']} vol: {item['avg_value']:,.6f}\n"
+                        f"Price: {item['close']}\n"
+                        f"Elapsed: {item['elapsed']}\n"
+                        f"Chart: {item['chart']}"
+                    )
+
+                msg = header + "".join(lines)
+
+                await enqueue_telegram_message(bucket["chat_id"], msg)
+                sent_leaderboards.add(bucket_key)
+                pending_leaderboards.pop(bucket_key, None)
+
+                logger.info(
+                    "Leaderboard queued | rule=%s interval=%s entries=%d",
+                    bucket["rule_id"], bucket["interval"], len(top_candidates)
+                )
+
+            await asyncio.sleep(5)
+
+        except asyncio.CancelledError:
+            logger.info("Leaderboard dispatcher loop cancelled.")
+            raise
+        except Exception as e:
+            logger.exception("Unexpected error in leaderboard_dispatcher_loop: %s", e)
+            await asyncio.sleep(2)
+
+def purge_old_alert_state() -> None:
+    now_ms = int(time.time() * 1000)
+    old_sent = set()
+
+    for rule_id, interval, candle_open_time in sent_leaderboards:
+        interval_ms = INTERVAL_TO_SECONDS.get(interval, 300) * 1000
+        if now_ms - candle_open_time > interval_ms * 3:
+            old_sent.add((rule_id, interval, candle_open_time))
+
+    if old_sent:
+        sent_leaderboards.difference_update(old_sent)
+
+    to_delete = []
+    now = time.time()
+    for bucket_key, bucket in pending_leaderboards.items():
+        interval_ms = INTERVAL_TO_SECONDS.get(bucket["interval"], 300) * 1000
+        if now * 1000 - bucket["candle_open_time"] > interval_ms * 3:
+            to_delete.append(bucket_key)
+
+    for bucket_key in to_delete:
+        pending_leaderboards.pop(bucket_key, None)
 
 # ============================================================
 # ALERT EVALUATION
@@ -388,48 +569,15 @@ async def evaluate_live_candle(application, symbol: str, interval: str, live_can
         if spike_pct is None or avg_value is None:
             continue
 
-        alert_key = (rule["id"], symbol, interval, current["open_time"])
-        if alert_key in alerted_candles:
-            continue
-
         if spike_pct >= threshold:
-            elapsed = human_elapsed_in_candle(current["open_time"], interval)
-            msg = (
-                f"📣 {side.upper()} VOLUME SPIKE\n\n"
-                f"Symbol: {symbol}\n"
-                f"Interval: {interval}\n"
-                f"Threshold: {threshold:.2f}%\n"
-                f"Baseline: last {baseline_candles} candles\n"
-                f"Live {side} volume: {current_value:,.6f}\n"
-                f"Average {side} volume: {avg_value:,.6f}\n"
-                f"Spike: +{spike_pct:.2f}%\n"
-                f"Price: {current['close']}\n"
-                f"Elapsed in candle: {elapsed}\n"
-                f"Mode: once per candle"
+            add_leaderboard_candidate(
+                rule=rule,
+                symbol=symbol,
+                interval=interval,
+                current=current,
+                avg_value=avg_value,
+                spike_pct=spike_pct,
             )
-
-            try:
-                alerted_candles.add(alert_key)
-                await enqueue_telegram_message(rule["chat_id"], msg)
-                logger.info(
-                    "Alert queued | rule=%s symbol=%s interval=%s side=%s spike=%.2f%%",
-                    rule["id"], symbol, interval, side, spike_pct
-                )
-            except Exception as e:
-                alerted_candles.discard(alert_key)
-                logger.warning("Failed queueing Telegram alert: %s", e)
-
-def purge_old_alert_keys() -> None:
-    now_ms = int(time.time() * 1000)
-    to_remove = set()
-
-    for rule_id, symbol, interval, candle_open_time in alerted_candles:
-        interval_ms = INTERVAL_TO_SECONDS.get(interval, 300) * 1000
-        if now_ms - candle_open_time > interval_ms * 3:
-            to_remove.add((rule_id, symbol, interval, candle_open_time))
-
-    if to_remove:
-        alerted_candles.difference_update(to_remove)
 
 # ============================================================
 # WEBSOCKET STREAMS
@@ -497,32 +645,33 @@ async def websocket_worker(application, interval: str, symbols: List[str]) -> No
 async def restart_streams(application) -> None:
     global ws_tasks
 
-    for task in ws_tasks:
-        task.cancel()
+    async with restart_lock:
+        for task in ws_tasks:
+            task.cancel()
 
-    if ws_tasks:
-        await asyncio.gather(*ws_tasks, return_exceptions=True)
+        if ws_tasks:
+            await asyncio.gather(*ws_tasks, return_exceptions=True)
 
-    ws_tasks = []
+        ws_tasks = []
 
-    await rebuild_tracking_map()
+        await rebuild_tracking_map()
 
-    if not tracked_symbols_by_interval:
-        logger.info("No active rules. No streams started.")
-        return
+        if not tracked_symbols_by_interval:
+            logger.info("No active rules. No streams started.")
+            return
 
-    for interval, symbols_set in tracked_symbols_by_interval.items():
-        symbols = sorted(symbols_set)
-        for group in chunked(symbols, STREAM_CHUNK_SIZE):
-            task = asyncio.create_task(websocket_worker(application, interval, group))
-            ws_tasks.append(task)
+        for interval, symbols_set in tracked_symbols_by_interval.items():
+            symbols = sorted(symbols_set)
+            for group in chunked(symbols, STREAM_CHUNK_SIZE):
+                task = asyncio.create_task(websocket_worker(application, interval, group))
+                ws_tasks.append(task)
 
-    logger.info("Started %d websocket task(s)", len(ws_tasks))
+        logger.info("Started %d websocket task(s)", len(ws_tasks))
 
 # ============================================================
 # TELEGRAM COMMANDS
 # ============================================================
-HELP_TEXT = """
+HELP_TEXT = f"""
 Volume Spike Scanner Bot
 
 Commands:
@@ -541,9 +690,10 @@ Examples:
 /add_rule 5m sell 12 15 BTCUSDT,ETHUSDT,SOLUSDT
 
 Notes:
+- ALL_USDT now means smart mode: top {TOP_ACTIVE_SYMBOL_COUNT} active USDT spot symbols
 - Alerts are live, not close-candle only
-- Alerts fire once per candle only
-- Next alert for the same rule/symbol comes only from the next candle
+- Alerts are ranked into one top {TOP_ALERTS_PER_MESSAGE} message
+- Next alert for the same rule comes from the next candle
 """
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -607,7 +757,6 @@ async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await reply_text_safe(update, "Please provide at least one symbol or use ALL_USDT.")
             return
 
-        # Skip live Binance validation here so command replies do not hang
         symbols_mode = "CUSTOM"
         symbols_json = json.dumps(symbols)
 
@@ -629,7 +778,7 @@ async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         ))
         await db.commit()
 
-    scope_text = "ALL_USDT" if symbols_mode == "ALL_USDT" else symbol_input.upper()
+    scope_text = f"TOP {TOP_ACTIVE_SYMBOL_COUNT} ACTIVE USDT COINS" if symbols_mode == "ALL_USDT" else symbol_input.upper()
     await reply_text_safe(
         update,
         "Rule added successfully!\n\n"
@@ -638,7 +787,7 @@ async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Threshold: {threshold_percent}%\n"
         f"Baseline candles: {baseline_candles}\n"
         f"Symbols: {scope_text}\n"
-        f"Mode: once per candle"
+        f"Mode: top {TOP_ALERTS_PER_MESSAGE} ranked alerts"
     )
 
     asyncio.create_task(restart_streams(context.application))
@@ -656,7 +805,11 @@ async def list_rules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     lines = []
     for r in rules:
-        symbols_text = "ALL_USDT" if r["symbols_mode"] == "ALL_USDT" else ",".join(r["symbols"])
+        symbols_text = (
+            f"TOP {TOP_ACTIVE_SYMBOL_COUNT} ACTIVE USDT"
+            if r["symbols_mode"] == "ALL_USDT"
+            else ",".join(r["symbols"])
+        )
         enabled_text = "ON" if r["enabled"] else "OFF"
         lines.append(
             f"ID {r['id']} | {enabled_text} | {r['interval']} | {r['side']} | "
@@ -691,9 +844,13 @@ async def delete_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await reply_text_safe(update, "Rule not found.")
         return
 
-    to_remove = {item for item in alerted_candles if item[0] == rule_id}
-    if to_remove:
-        alerted_candles.difference_update(to_remove)
+    keys_to_remove = [k for k, v in pending_leaderboards.items() if v["rule_id"] == rule_id]
+    for k in keys_to_remove:
+        pending_leaderboards.pop(k, None)
+
+    sent_to_remove = {k for k in sent_leaderboards if k[0] == rule_id}
+    if sent_to_remove:
+        sent_leaderboards.difference_update(sent_to_remove)
 
     await reply_text_safe(update, f"Deleted rule {rule_id}.")
     asyncio.create_task(restart_streams(context.application))
@@ -711,8 +868,18 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 async def maintenance_loop(application) -> None:
     while True:
         try:
-            purge_old_alert_keys()
+            purge_old_alert_state()
             await fetch_all_usdt_symbols(force=False)
+
+            if await has_dynamic_top20_rules():
+                old_top = list(top_active_usdt_symbols_cache)
+                new_top = await fetch_top_active_usdt_symbols(force=True)
+                if old_top and new_top != old_top:
+                    logger.info("Top active symbol list changed. Restarting streams.")
+                    asyncio.create_task(restart_streams(application))
+            else:
+                await fetch_top_active_usdt_symbols(force=False)
+
         except Exception as e:
             logger.warning("Maintenance loop error: %s", e)
 
@@ -722,15 +889,17 @@ async def maintenance_loop(application) -> None:
 # APP LIFECYCLE
 # ============================================================
 async def post_init(application) -> None:
-    global maintenance_task, telegram_sender_task
+    global maintenance_task, telegram_sender_task, leaderboard_dispatcher_task
 
     await init_db()
 
     telegram_sender_task = asyncio.create_task(telegram_sender_loop(application))
+    leaderboard_dispatcher_task = asyncio.create_task(leaderboard_dispatcher_loop(application))
 
     async def delayed_start():
         await asyncio.sleep(5)
         await fetch_all_usdt_symbols(force=True)
+        await fetch_top_active_usdt_symbols(force=True)
         await restart_streams(application)
         logger.info("Scanner started after delay.")
 
@@ -740,7 +909,7 @@ async def post_init(application) -> None:
     logger.info("Bot initialized.")
 
 async def shutdown() -> None:
-    global shared_http_session, maintenance_task, telegram_sender_task
+    global shared_http_session, maintenance_task, telegram_sender_task, leaderboard_dispatcher_task
 
     for task in ws_tasks:
         task.cancel()
@@ -754,6 +923,10 @@ async def shutdown() -> None:
     if telegram_sender_task:
         telegram_sender_task.cancel()
         await asyncio.gather(telegram_sender_task, return_exceptions=True)
+
+    if leaderboard_dispatcher_task:
+        leaderboard_dispatcher_task.cancel()
+        await asyncio.gather(leaderboard_dispatcher_task, return_exceptions=True)
 
     if shared_http_session and not shared_http_session.closed:
         await shared_http_session.close()
