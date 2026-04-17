@@ -1,4 +1,3 @@
-
 import os
 import json
 import time
@@ -23,27 +22,15 @@ BINANCE_WS = "wss://stream.binance.com:9443/stream"
 
 DB_FILE = "scanner.db"
 
-# Only the intervals you asked for
 VALID_INTERVALS = {"5m", "1h"}
-
-# How many previous closed candles to compare against by default
 DEFAULT_BASELINE_CANDLES = 20
-
-# How many symbols to place in one combined websocket connection
-# Keep this conservative so URL length and stream size stay manageable.
 STREAM_CHUNK_SIZE = 120
-
-# Limit in-memory candle history
 MAX_CANDLE_HISTORY = 300
-
-# Refresh exchange symbols every N seconds
 SYMBOL_REFRESH_SECONDS = 3600
 
-# Telegram sending protection
 MIN_TELEGRAM_SEND_DELAY_SECONDS = 1.2
 MAX_TELEGRAM_RETRIES = 5
 
-# Used for alert text only
 INTERVAL_TO_SECONDS = {
     "5m": 5 * 60,
     "1h": 60 * 60,
@@ -61,39 +48,20 @@ logger = logging.getLogger("volume_scanner_bot")
 # ============================================================
 # GLOBAL STATE
 # ============================================================
-
-# candle_cache[(symbol, interval)] = deque([candle_dict, ...], maxlen=MAX_CANDLE_HISTORY)
-# candle_dict = {
-#   "open_time": int,
-#   "close_time": int,
-#   "buy": float,
-#   "sell": float,
-#   "close": float
-# }
 candle_cache: Dict[Tuple[str, str], deque] = defaultdict(lambda: deque(maxlen=MAX_CANDLE_HISTORY))
-
-# alerted_candles stores once-per-candle alerts:
-# (rule_id, symbol, interval, candle_open_time)
 alerted_candles: Set[Tuple[int, str, str, int]] = set()
-
-# current websocket tasks
 ws_tasks: List[asyncio.Task] = []
 
-# background tasks
 maintenance_task: Optional[asyncio.Task] = None
 telegram_sender_task: Optional[asyncio.Task] = None
 
-# currently tracked interval -> symbols
 tracked_symbols_by_interval: Dict[str, Set[str]] = defaultdict(set)
 
-# cached all USDT spot symbols
 all_usdt_symbols_cache: List[str] = []
 all_usdt_symbols_last_refresh = 0
 
-# aiohttp session reused for REST + WS
 shared_http_session: Optional[aiohttp.ClientSession] = None
 
-# Telegram outgoing message queue
 telegram_send_queue: "asyncio.Queue[Tuple[int, str]]" = asyncio.Queue()
 
 # ============================================================
@@ -178,8 +146,6 @@ def normalize_symbol_list(symbols_csv: str) -> List[str]:
     return [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
 
 def parse_kline_rest_row(row: list) -> dict:
-    # Spot kline REST fields:
-    # [0]=open time, [4]=close price, [5]=volume, [6]=close time, [9]=taker buy base asset volume
     total_volume = float(row[5])
     taker_buy_base = float(row[9])
     buy_volume = taker_buy_base
@@ -236,9 +202,7 @@ async def telegram_sender_loop(application) -> None:
                 try:
                     await application.bot.send_message(chat_id=chat_id, text=text)
                     sent = True
-                    logger.info("Telegram message sent to chat_id=%s", chat_id)
-
-                    # Small delay after every successful send
+                    logger.info("Telegram alert sent to chat_id=%s", chat_id)
                     await asyncio.sleep(MIN_TELEGRAM_SEND_DELAY_SECONDS)
 
                 except RetryAfter as e:
@@ -260,7 +224,7 @@ async def telegram_sender_loop(application) -> None:
 
                 except Exception as e:
                     logger.warning(
-                        "Failed sending Telegram message to chat_id=%s on attempt %s: %s",
+                        "Failed sending Telegram alert to chat_id=%s on attempt %s: %s",
                         chat_id,
                         attempt,
                         e,
@@ -268,7 +232,7 @@ async def telegram_sender_loop(application) -> None:
                     await asyncio.sleep(2)
 
             if not sent:
-                logger.error("Dropped Telegram message after %s attempts for chat_id=%s", MAX_TELEGRAM_RETRIES, chat_id)
+                logger.error("Dropped Telegram alert after %s attempts for chat_id=%s", MAX_TELEGRAM_RETRIES, chat_id)
 
             telegram_send_queue.task_done()
 
@@ -280,9 +244,18 @@ async def telegram_sender_loop(application) -> None:
             await asyncio.sleep(2)
 
 async def reply_text_safe(update: Update, text: str) -> None:
-    if update.effective_chat is None:
+    if update.message is None:
         return
-    await enqueue_telegram_message(update.effective_chat.id, text)
+
+    try:
+        await update.message.reply_text(text)
+    except RetryAfter as e:
+        retry_after = int(getattr(e, "retry_after", 5))
+        logger.warning("Direct reply rate-limited. Waiting %s seconds.", retry_after)
+        await asyncio.sleep(retry_after + 1)
+        await update.message.reply_text(text)
+    except Exception as e:
+        logger.warning("Failed sending direct reply: %s", e)
 
 # ============================================================
 # BINANCE DATA
@@ -327,10 +300,6 @@ async def fetch_klines(symbol: str, interval: str, limit: int) -> List[list]:
         return data
 
 async def preload_symbol_history(symbol: str, interval: str, needed_closed_candles: int) -> None:
-    """
-    Load enough recent klines so the bot has baseline candles immediately.
-    We ask for a bit extra because the newest candle may be currently forming.
-    """
     key = (symbol, interval)
     existing = candle_cache[key]
     if len(existing) >= needed_closed_candles + 2:
@@ -359,7 +328,6 @@ async def rebuild_tracking_map() -> None:
     if not rules:
         return
 
-    # refresh symbol universe first
     await fetch_all_usdt_symbols()
 
     max_needed_per_interval: Dict[str, int] = defaultdict(lambda: DEFAULT_BASELINE_CANDLES)
@@ -374,7 +342,6 @@ async def rebuild_tracking_map() -> None:
         for sym in symbols:
             tracked_symbols_by_interval[interval].add(sym)
 
-    # preload baseline history
     preload_tasks = []
     for interval, symbols in tracked_symbols_by_interval.items():
         needed = max_needed_per_interval[interval]
@@ -382,7 +349,6 @@ async def rebuild_tracking_map() -> None:
             preload_tasks.append(preload_symbol_history(sym, interval, needed))
 
     if preload_tasks:
-        # Avoid blowing up on one failure
         for batch in chunked(preload_tasks, 150):
             await asyncio.gather(*batch, return_exceptions=True)
 
@@ -402,7 +368,7 @@ async def evaluate_live_candle(application, symbol: str, interval: str, live_can
             if symbol not in [s.upper() for s in rule["symbols"]]:
                 continue
 
-        side = rule["side"]  # buy or sell
+        side = rule["side"]
         threshold = rule["threshold_percent"]
         baseline_candles = rule["baseline_candles"]
 
@@ -412,7 +378,6 @@ async def evaluate_live_candle(application, symbol: str, interval: str, live_can
         if len(candles) < baseline_candles + 1:
             continue
 
-        # We compare the current live candle against previous CLOSED candles.
         current = candles[-1]
         previous = candles[-(baseline_candles + 1):-1]
 
@@ -423,7 +388,6 @@ async def evaluate_live_candle(application, symbol: str, interval: str, live_can
         if spike_pct is None or avg_value is None:
             continue
 
-        # once per candle only
         alert_key = (rule["id"], symbol, interval, current["open_time"])
         if alert_key in alerted_candles:
             continue
@@ -457,10 +421,6 @@ async def evaluate_live_candle(application, symbol: str, interval: str, live_can
                 logger.warning("Failed queueing Telegram alert: %s", e)
 
 def purge_old_alert_keys() -> None:
-    """
-    Keep alerted_candles from growing forever.
-    Remove keys for candles that are definitely old.
-    """
     now_ms = int(time.time() * 1000)
     to_remove = set()
 
@@ -648,12 +608,7 @@ async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await reply_text_safe(update, "Please provide at least one symbol or use ALL_USDT.")
             return
 
-        valid_symbols = set(await fetch_all_usdt_symbols())
-        invalid = [s for s in symbols if s not in valid_symbols]
-        if invalid:
-            await reply_text_safe(update, f"Invalid symbol(s): {', '.join(invalid)}")
-            return
-
+        # Skip live Binance validation here to avoid command hanging
         symbols_mode = "CUSTOM"
         symbols_json = json.dumps(symbols)
 
