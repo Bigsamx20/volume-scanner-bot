@@ -2,7 +2,8 @@ import os
 import time
 import threading
 import requests
-from pybit.unified_trading import HTTP
+from copy import deepcopy
+from pybit.unified_trading import HTTP, WebSocket
 
 # =========================
 # CONFIG
@@ -15,21 +16,24 @@ CATEGORY = os.getenv("BYBIT_CATEGORY", "linear")
 TOP_N = int(os.getenv("TOP_N", "30"))
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "300"))
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "300"))
-ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", "900"))
 SHORTLIST_REFRESH_SECONDS = int(os.getenv("SHORTLIST_REFRESH_SECONDS", "300"))
 REQUEST_SLEEP_SECONDS = float(os.getenv("REQUEST_SLEEP_SECONDS", "0.12"))
 HEARTBEAT_TO_TELEGRAM = os.getenv("HEARTBEAT_TO_TELEGRAM", "true").lower() == "true"
 
 TIMEFRAMES = ["1", "5", "60"]
 
-# Same settings apply to all symbols
-TIMEFRAME_SETTINGS = {
+# =========================
+# DEFAULT SETTINGS FOR ALL SYMBOLS
+# RSI default: overbought=85, oversold=20
+# EMA stays enabled
+# =========================
+TIMEFRAME_DEFAULTS = {
     "1": {
         "rsi": {
             "enabled": True,
             "length": 14,
-            "overbought": 70,
-            "oversold": 30,
+            "overbought": 85,
+            "oversold": 20,
         },
         "ema_distance": {
             "enabled": True,
@@ -42,22 +46,22 @@ TIMEFRAME_SETTINGS = {
         "rsi": {
             "enabled": True,
             "length": 14,
-            "overbought": 72,
-            "oversold": 28,
+            "overbought": 85,
+            "oversold": 20,
         },
         "ema_distance": {
             "enabled": True,
             "ema_length": 200,
-            "above_percent": 4.0,
-            "below_percent": -4.0,
+            "above_percent": 2.0,
+            "below_percent": -2.0,
         },
     },
     "60": {
         "rsi": {
             "enabled": True,
             "length": 14,
-            "overbought": 75,
-            "oversold": 25,
+            "overbought": 85,
+            "oversold": 20,
         },
         "ema_distance": {
             "enabled": True,
@@ -68,14 +72,22 @@ TIMEFRAME_SETTINGS = {
     },
 }
 
+# Optional per-symbol overrides
+SYMBOL_OVERRIDES = {}
+
 # =========================
 # GLOBALS
 # =========================
 session = HTTP(testnet=False)
 data = {}
-last_alert_time = {}
+last_alert_candle = {}
 shortlist = set()
 shortlist_lock = threading.Lock()
+ws_connections = {}
+
+# Track live candle start times so alerts trigger only once per candle
+current_candle_start = {}
+last_closed_candle_start = {}
 
 
 # =========================
@@ -104,15 +116,6 @@ def send_telegram(message: str):
 # =========================
 # HELPERS
 # =========================
-def can_alert(key: str) -> bool:
-    now = time.time()
-    last = last_alert_time.get(key, 0)
-    if now - last >= ALERT_COOLDOWN:
-        last_alert_time[key] = now
-        return True
-    return False
-
-
 def heartbeat():
     while True:
         print("BOT ALIVE ✅")
@@ -121,6 +124,57 @@ def heartbeat():
         time.sleep(HEARTBEAT_SECONDS)
 
 
+def safe_float(value, default=None):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def ensure_symbol_state(symbol: str):
+    if symbol not in data:
+        data[symbol] = {}
+    if symbol not in current_candle_start:
+        current_candle_start[symbol] = {}
+    if symbol not in last_closed_candle_start:
+        last_closed_candle_start[symbol] = {}
+
+    for tf in TIMEFRAMES:
+        if tf not in data[symbol]:
+            data[symbol][tf] = []
+
+
+def deep_merge(base: dict, override: dict) -> dict:
+    result = deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def get_effective_settings(symbol: str, tf: str) -> dict:
+    defaults = TIMEFRAME_DEFAULTS.get(tf, {})
+    symbol_cfg = SYMBOL_OVERRIDES.get(symbol, {})
+    tf_override = symbol_cfg.get(tf, {})
+    return deep_merge(defaults, tf_override)
+
+
+def should_alert_once_per_candle(alert_type: str, symbol: str, tf: str, candle_start: int) -> bool:
+    key = f"{alert_type}:{symbol}:{tf}"
+    last = last_alert_candle.get(key)
+
+    if last == candle_start:
+        return False
+
+    last_alert_candle[key] = candle_start
+    return True
+
+
+# =========================
+# INDICATORS
+# =========================
 def ema(values, length=200):
     if len(values) < length:
         return None
@@ -160,62 +214,9 @@ def rsi(values, length=14):
     return 100 - (100 / (1 + rs))
 
 
-def ensure_symbol_state(symbol: str):
-    if symbol not in data:
-        data[symbol] = {}
-    for tf in TIMEFRAMES:
-        if tf not in data[symbol]:
-            data[symbol][tf] = []
-
-
-def safe_float(value, default=None):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
 # =========================
 # MARKET DISCOVERY
 # =========================
-def get_all_linear_symbols():
-    symbols = []
-    cursor = None
-
-    while True:
-        kwargs = {"category": CATEGORY, "limit": 1000}
-        if cursor:
-            kwargs["cursor"] = cursor
-
-        response = session.get_instruments_info(**kwargs)
-        result = response.get("result", {})
-        items = result.get("list", [])
-
-        for item in items:
-            symbol = item.get("symbol")
-            status = item.get("status")
-            quote_coin = item.get("quoteCoin")
-
-            if not symbol:
-                continue
-
-            if status != "Trading":
-                continue
-
-            if quote_coin != "USDT":
-                continue
-
-            symbols.append(symbol)
-
-        cursor = result.get("nextPageCursor")
-        if not cursor:
-            break
-
-    symbols = sorted(set(symbols))
-    print(f"Loaded {len(symbols)} symbols")
-    return symbols
-
-
 def get_tickers():
     response = session.get_tickers(category=CATEGORY)
     return response.get("result", {}).get("list", [])
@@ -240,22 +241,18 @@ def build_shortlist_from_tickers():
         if last_price is None or last_price <= 0:
             continue
 
-        # Filter out dead / illiquid instruments
         if turnover_24h is None or turnover_24h <= 0:
             continue
 
-        # 1h gainers can be estimated directly if prevPrice1h exists
         if prev_price_1h and prev_price_1h > 0:
             change_1h = ((last_price - prev_price_1h) / prev_price_1h) * 100
             one_hour_candidates.append((symbol, change_1h, turnover_24h))
         else:
             one_hour_candidates.append((symbol, 0.0, turnover_24h))
 
-        # For 1m/5m, use 24h-turnover as a cheap prefilter and refine later with klines
         one_min_candidates.append((symbol, turnover_24h))
         five_min_candidates.append((symbol, turnover_24h))
 
-    # For 1m and 5m we first choose liquid symbols only
     one_min_candidates.sort(key=lambda x: x[1], reverse=True)
     five_min_candidates.sort(key=lambda x: x[1], reverse=True)
     one_hour_candidates.sort(key=lambda x: x[1], reverse=True)
@@ -326,7 +323,7 @@ def refresh_shortlist_and_history():
 
 
 # =========================
-# RANKING FROM LOADED DATA
+# RANKING
 # =========================
 def get_top_gainers_from_history(tf: str, top_n: int):
     changes = []
@@ -355,27 +352,29 @@ def get_top_gainers_from_history(tf: str, top_n: int):
 # =========================
 # SIGNALS
 # =========================
-def process_indicators(symbol: str, tf: str):
+def process_indicators(symbol: str, tf: str, candle_start: int):
     arr = data.get(symbol, {}).get(tf, [])
     if not arr:
         return
 
     close = arr[-1]
-    cfg = TIMEFRAME_SETTINGS.get(tf, {})
+    cfg = get_effective_settings(symbol, tf)
+
     rsi_cfg = cfg.get("rsi", {})
     ema_cfg = cfg.get("ema_distance", {})
 
     if rsi_cfg.get("enabled", False):
-        r = rsi(arr, int(rsi_cfg.get("length", 14)))
+        rsi_length = int(rsi_cfg.get("length", 14))
+        r = rsi(arr, rsi_length)
+
         if r is not None:
             print(f"{symbol} {tf} RSI: {r:.2f}")
 
-            overbought = float(rsi_cfg.get("overbought", 70))
-            oversold = float(rsi_cfg.get("oversold", 30))
+            overbought = float(rsi_cfg.get("overbought", 85))
+            oversold = float(rsi_cfg.get("oversold", 20))
 
             if r >= overbought:
-                key = f"rsi_overbought:{symbol}:{tf}"
-                if can_alert(key):
+                if should_alert_once_per_candle("rsi_overbought", symbol, tf, candle_start):
                     send_telegram(
                         f"🚨 RSI OVERBOUGHT\n"
                         f"Symbol: {symbol}\n"
@@ -385,8 +384,7 @@ def process_indicators(symbol: str, tf: str):
                     )
 
             if r <= oversold:
-                key = f"rsi_oversold:{symbol}:{tf}"
-                if can_alert(key):
+                if should_alert_once_per_candle("rsi_oversold", symbol, tf, candle_start):
                     send_telegram(
                         f"🚨 RSI OVERSOLD\n"
                         f"Symbol: {symbol}\n"
@@ -407,8 +405,7 @@ def process_indicators(symbol: str, tf: str):
             below_percent = float(ema_cfg.get("below_percent", -2.0))
 
             if dist >= above_percent:
-                key = f"ema_above:{symbol}:{tf}"
-                if can_alert(key):
+                if should_alert_once_per_candle("ema_above", symbol, tf, candle_start):
                     send_telegram(
                         f"📈 PRICE ABOVE EMA{ema_length}\n"
                         f"Symbol: {symbol}\n"
@@ -418,8 +415,7 @@ def process_indicators(symbol: str, tf: str):
                     )
 
             if dist <= below_percent:
-                key = f"ema_below:{symbol}:{tf}"
-                if can_alert(key):
+                if should_alert_once_per_candle("ema_below", symbol, tf, candle_start):
                     send_telegram(
                         f"📉 PRICE BELOW EMA{ema_length}\n"
                         f"Symbol: {symbol}\n"
@@ -430,12 +426,118 @@ def process_indicators(symbol: str, tf: str):
 
 
 # =========================
-# BACKGROUND LOOPS
+# LIVE KLINE HANDLER
+# =========================
+def handle_kline(msg):
+    try:
+        if not isinstance(msg, dict):
+            return
+
+        data_list = msg.get("data")
+        if not isinstance(data_list, list):
+            return
+
+        with shortlist_lock:
+            current_shortlist = set(shortlist)
+
+        for item in data_list:
+            if not isinstance(item, dict):
+                continue
+
+            symbol = str(item.get("symbol", "")).upper()
+            interval = str(item.get("interval", ""))
+            close = safe_float(item.get("close"))
+            start_time = item.get("start")
+            confirm = bool(item.get("confirm", False))
+
+            if not symbol or not interval or close is None or start_time is None:
+                continue
+
+            if symbol not in current_shortlist:
+                continue
+
+            if interval not in TIMEFRAMES:
+                continue
+
+            ensure_symbol_state(symbol)
+
+            previous_start = current_candle_start[symbol].get(interval)
+            new_candle_started = previous_start is None or start_time != previous_start
+
+            if new_candle_started:
+                current_candle_start[symbol][interval] = start_time
+                arr = data[symbol][interval]
+                arr.append(close)
+
+                if len(arr) > HISTORY_LIMIT:
+                    arr.pop(0)
+            else:
+                arr = data[symbol][interval]
+                if not arr:
+                    arr.append(close)
+                else:
+                    arr[-1] = close
+
+            process_indicators(symbol, interval, int(start_time))
+
+            if confirm:
+                last_closed_candle_start[symbol][interval] = start_time
+
+    except Exception as e:
+        print("WebSocket handler error:", e)
+
+
+# =========================
+# WEBSOCKET SUBSCRIPTIONS
+# =========================
+def start_websocket_for_timeframe(tf: str):
+    ws = WebSocket(testnet=False, channel_type=CATEGORY)
+
+    def callback(msg):
+        handle_kline(msg)
+
+    with shortlist_lock:
+        symbols = list(shortlist)
+
+    if not symbols:
+        return None
+
+    for symbol in symbols:
+        try:
+            ws.kline_stream(
+                interval=int(tf),
+                symbol=symbol,
+                callback=callback
+            )
+            print(f"Subscribed live: {symbol} {tf}")
+        except Exception as e:
+            print(f"Subscription error {symbol} {tf}: {e}")
+
+    return ws
+
+
+def restart_websockets():
+    global ws_connections
+    print("Restarting WebSocket subscriptions...")
+
+    new_connections = {}
+    for tf in TIMEFRAMES:
+        ws = start_websocket_for_timeframe(tf)
+        if ws is not None:
+            new_connections[tf] = ws
+
+    ws_connections = new_connections
+    print("WebSocket subscriptions refreshed")
+
+
+# =========================
+# LOOPS
 # =========================
 def shortlist_refresh_loop():
     while True:
         try:
             refresh_shortlist_and_history()
+            restart_websockets()
         except Exception as e:
             print("Shortlist refresh error:", e)
 
@@ -464,15 +566,6 @@ def scan_loop():
             print("Top 1m gainers:", top_1m[:10])
             print("Top 5m gainers:", top_5m[:10])
             print("Top 1h gainers:", top_1h[:10])
-
-            for symbol in top_1m:
-                process_indicators(symbol, "1")
-
-            for symbol in top_5m:
-                process_indicators(symbol, "5")
-
-            for symbol in top_1h:
-                process_indicators(symbol, "60")
 
             time.sleep(30)
 
