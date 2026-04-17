@@ -50,8 +50,8 @@ logger = logging.getLogger("volume_scanner_bot")
 # ============================================================
 candle_cache: Dict[Tuple[str, str], deque] = defaultdict(lambda: deque(maxlen=MAX_CANDLE_HISTORY))
 alerted_candles: Set[Tuple[int, str, str, int]] = set()
-ws_tasks: List[asyncio.Task] = []
 
+ws_tasks: List[asyncio.Task] = []
 maintenance_task: Optional[asyncio.Task] = None
 telegram_sender_task: Optional[asyncio.Task] = None
 
@@ -411,7 +411,6 @@ async def evaluate_live_candle(application, symbol: str, interval: str, live_can
             try:
                 alerted_candles.add(alert_key)
                 await enqueue_telegram_message(rule["chat_id"], msg)
-
                 logger.info(
                     "Alert queued | rule=%s symbol=%s interval=%s side=%s spike=%.2f%%",
                     rule["id"], symbol, interval, side, spike_pct
@@ -608,7 +607,7 @@ async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await reply_text_safe(update, "Please provide at least one symbol or use ALL_USDT.")
             return
 
-        # Skip live Binance validation here to avoid command hanging
+        # Skip live Binance validation here so command replies do not hang
         symbols_mode = "CUSTOM"
         symbols_json = json.dumps(symbols)
 
@@ -633,7 +632,7 @@ async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     scope_text = "ALL_USDT" if symbols_mode == "ALL_USDT" else symbol_input.upper()
     await reply_text_safe(
         update,
-        "Rule added.\n\n"
+        "Rule added successfully!\n\n"
         f"Interval: {interval}\n"
         f"Side: {side}\n"
         f"Threshold: {threshold_percent}%\n"
@@ -726,10 +725,16 @@ async def post_init(application) -> None:
     global maintenance_task, telegram_sender_task
 
     await init_db()
-    await fetch_all_usdt_symbols(force=True)
 
     telegram_sender_task = asyncio.create_task(telegram_sender_loop(application))
-    await restart_streams(application)
+
+    async def delayed_start():
+        await asyncio.sleep(5)
+        await fetch_all_usdt_symbols(force=True)
+        await restart_streams(application)
+        logger.info("Scanner started after delay.")
+
+    asyncio.create_task(delayed_start())
 
     maintenance_task = asyncio.create_task(maintenance_loop(application))
     logger.info("Bot initialized.")
