@@ -77,7 +77,7 @@ def handle(msg):
 def main():
     init_state()
 
-    ws = WebSocket(channel_type="linear")
+   ws = WebSocket(testnet=False, channel_type="linear")
 
     for s in SYMBOLS:
         for tf in TIMEFRAMES:
