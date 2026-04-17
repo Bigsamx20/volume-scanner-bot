@@ -13,36 +13,48 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 CATEGORY = os.getenv("BYBIT_CATEGORY", "linear")
-TOP_N = int(os.getenv("TOP_N", "30"))
+TOP_N = int(os.getenv("TOP_N", "500"))
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "300"))
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "300"))
 SHORTLIST_REFRESH_SECONDS = int(os.getenv("SHORTLIST_REFRESH_SECONDS", "300"))
 REQUEST_SLEEP_SECONDS = float(os.getenv("REQUEST_SLEEP_SECONDS", "0.12"))
 HEARTBEAT_TO_TELEGRAM = os.getenv("HEARTBEAT_TO_TELEGRAM", "true").lower() == "true"
 
-# 1h only
-TIMEFRAMES = ["60"]
+# 5m and 1h
+TIMEFRAMES = ["5", "60"]
 
 # =========================
 # DEFAULT SETTINGS FOR ALL SYMBOLS
-# RSI defaults:
-# overbought = 75
-# oversold = 30
-# EMA200 settings unchanged
+# These are easier to trigger than your old values
+# so you can verify alerts are working.
 # =========================
 TIMEFRAME_DEFAULTS = {
+    "5": {
+        "rsi": {
+            "enabled": True,
+            "length": 14,
+            "overbought": 70,
+            "oversold": 30,
+        },
+        "ema_distance": {
+            "enabled": True,
+            "ema_length": 50,
+            "above_percent": 0.5,
+            "below_percent": -0.5,
+        },
+    },
     "60": {
         "rsi": {
             "enabled": True,
             "length": 14,
-            "overbought": 80,
-            "oversold": 25,
+            "overbought": 70,
+            "oversold": 30,
         },
         "ema_distance": {
             "enabled": True,
-            "ema_length": 200,
-            "above_percent": 1.5,
-            "below_percent": -1.5,
+            "ema_length": 100,
+            "above_percent": 1.0,
+            "below_percent": -1.0,
         },
     },
 }
@@ -51,11 +63,11 @@ TIMEFRAME_DEFAULTS = {
 SYMBOL_OVERRIDES = {
     # Example:
     # "BTCUSDT": {
+    #     "5": {
+    #         "rsi": {"overbought": 75, "oversold": 25}
+    #     },
     #     "60": {
-    #         "rsi": {
-    #             "overbought": 90,
-    #             "oversold": 18,
-    #         }
+    #         "ema_distance": {"ema_length": 200, "above_percent": 1.5, "below_percent": -1.5}
     #     }
     # }
 }
@@ -69,15 +81,18 @@ last_alert_candle = {}
 shortlist = set()
 shortlist_lock = threading.Lock()
 ws_connections = {}
-
 current_candle_start = {}
 last_closed_candle_start = {}
 
+telegram_offset = 0
+last_command_time = 0
 
 # =========================
 # TELEGRAM
 # =========================
 def send_telegram(message: str):
+    print("Trying to send Telegram:", message)
+
     if not TELEGRAM_ENABLED:
         print("Telegram disabled (TELEGRAM_ENABLED is not true)")
         return
@@ -93,9 +108,32 @@ def send_telegram(message: str):
             json={"chat_id": CHAT_ID, "text": message},
             timeout=10,
         )
-        print("Telegram status:", response.status_code, response.text)
+        print("Telegram status:", response.status_code)
+        print("Telegram body:", response.text)
+        response.raise_for_status()
     except Exception as e:
         print("Telegram error:", e)
+
+
+def get_telegram_updates(offset=None, timeout=20):
+    if not TELEGRAM_ENABLED or not BOT_TOKEN:
+        return []
+
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+        params = {"timeout": timeout}
+        if offset is not None:
+            params["offset"] = offset
+
+        response = requests.get(url, params=params, timeout=timeout + 5)
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("ok"):
+            return []
+        return payload.get("result", [])
+    except Exception as e:
+        print("Telegram getUpdates error:", e)
+        return []
 
 
 # =========================
@@ -119,6 +157,8 @@ def safe_float(value, default=None):
 def normalize_interval(interval_value):
     s = str(interval_value).strip().lower()
     mapping = {
+        "5": "5",
+        "5m": "5",
         "60": "60",
         "60m": "60",
         "1h": "60",
@@ -219,11 +259,11 @@ def get_tickers():
 
 def build_shortlist_from_tickers():
     tickers = get_tickers()
-    one_hour_candidates = []
+    candidates = []
 
     for item in tickers:
-        symbol = item.get("symbol")
-        if not symbol:
+        symbol = str(item.get("symbol", "")).upper()
+        if not symbol.endswith("USDT"):
             continue
 
         last_price = safe_float(item.get("lastPrice"))
@@ -238,14 +278,14 @@ def build_shortlist_from_tickers():
 
         if prev_price_1h and prev_price_1h > 0:
             change_1h = ((last_price - prev_price_1h) / prev_price_1h) * 100
-            one_hour_candidates.append((symbol, change_1h, turnover_24h))
         else:
-            one_hour_candidates.append((symbol, 0.0, turnover_24h))
+            change_1h = 0.0
 
-    one_hour_candidates.sort(key=lambda x: x[1], reverse=True)
-    top_1h = [s for s, _, _ in one_hour_candidates[:TOP_N]]
+        candidates.append((symbol, abs(change_1h), turnover_24h))
 
-    return sorted(set(top_1h))
+    # sort by absolute 1h move, then liquidity
+    candidates.sort(key=lambda x: (x[1], x[2]), reverse=True)
+    return [s for s, _, _ in candidates[:TOP_N]]
 
 
 # =========================
@@ -349,15 +389,17 @@ def process_indicators(symbol: str, tf: str, candle_start: int):
     rsi_cfg = cfg.get("rsi", {})
     ema_cfg = cfg.get("ema_distance", {})
 
+    print(f"DEBUG {symbol} {tf} candles={len(arr)} close={close}")
+
     if rsi_cfg.get("enabled", False):
         rsi_length = int(rsi_cfg.get("length", 14))
         r = rsi(arr, rsi_length)
 
         if r is not None:
-            print(f"{symbol} {tf} RSI: {r:.2f}")
+            overbought = float(rsi_cfg.get("overbought", 70))
+            oversold = float(rsi_cfg.get("oversold", 30))
 
-            overbought = float(rsi_cfg.get("overbought", 85))
-            oversold = float(rsi_cfg.get("oversold", 20))
+            print(f"{symbol} {tf} RSI: {r:.2f} | OB={overbought} OS={oversold}")
 
             if r >= overbought:
                 print(f"RSI overbought condition met: {symbol} {tf}")
@@ -382,15 +424,18 @@ def process_indicators(symbol: str, tf: str, candle_start: int):
                     )
 
     if ema_cfg.get("enabled", False):
-        ema_length = int(ema_cfg.get("ema_length", 200))
+        ema_length = int(ema_cfg.get("ema_length", 50))
         ema_value = ema(arr, ema_length)
 
         if ema_value is not None and ema_value != 0:
             dist = ((close - ema_value) / ema_value) * 100
-            print(f"{symbol} {tf} EMA{ema_length} DIST: {dist:.2f}%")
+            above_percent = float(ema_cfg.get("above_percent", 0.5))
+            below_percent = float(ema_cfg.get("below_percent", -0.5))
 
-            above_percent = float(ema_cfg.get("above_percent", 20.0))
-            below_percent = float(ema_cfg.get("below_percent", -20.0))
+            print(
+                f"{symbol} {tf} EMA{ema_length} DIST: {dist:.2f}% | "
+                f"above={above_percent} below={below_percent}"
+            )
 
             if dist >= above_percent:
                 print(f"EMA above condition met: {symbol} {tf}")
@@ -462,11 +507,10 @@ def handle_kline(msg):
                 continue
 
             ensure_symbol_state(symbol)
+            arr = data[symbol][interval]
 
             previous_start = current_candle_start[symbol].get(interval)
             new_candle_started = previous_start is None or start_time != previous_start
-
-            arr = data[symbol][interval]
 
             if new_candle_started:
                 current_candle_start[symbol][interval] = start_time
@@ -482,7 +526,7 @@ def handle_kline(msg):
                 else:
                     arr[-1] = close
 
-            # Real-time alerts, but only once per candle
+            # Real-time alerts, once per candle
             process_indicators(symbol, interval, int(start_time))
 
             if confirm:
@@ -517,6 +561,7 @@ def start_websocket_for_timeframe(tf: str):
                 callback=callback
             )
             print(f"Subscribed live: {symbol} {tf}")
+            time.sleep(0.01)
         except Exception as e:
             print(f"Subscription error {symbol} {tf}: {e}")
 
@@ -535,6 +580,117 @@ def restart_websockets():
 
     ws_connections = new_connections
     print("WebSocket subscriptions refreshed")
+
+
+# =========================
+# TELEGRAM COMMANDS
+# =========================
+def force_test_alerts():
+    send_telegram(
+        "🚨 FORCE TEST ALERT\n"
+        "Symbol: BTCUSDT\n"
+        "Timeframe: 5\n"
+        "RSI: 72.50\n"
+        "Threshold: 70"
+    )
+    send_telegram(
+        "📈 FORCE TEST EMA ALERT\n"
+        "Symbol: BTCUSDT\n"
+        "Timeframe: 60\n"
+        "Distance: 1.23%\n"
+        "Threshold: 1.0%"
+    )
+
+
+def get_status_text():
+    with shortlist_lock:
+        symbols = list(shortlist)
+
+    return (
+        f"✅ Bot running\n"
+        f"Category: {CATEGORY}\n"
+        f"TOP_N: {TOP_N}\n"
+        f"Timeframes: {', '.join(TIMEFRAMES)}\n"
+        f"Shortlist size: {len(symbols)}\n"
+        f"History limit: {HISTORY_LIMIT}\n"
+        f"Telegram enabled: {TELEGRAM_ENABLED}"
+    )
+
+
+def get_symbols_text():
+    with shortlist_lock:
+        symbols = sorted(list(shortlist))
+
+    preview = symbols[:30]
+    return (
+        f"📊 Shortlist size: {len(symbols)}\n"
+        f"Sample:\n" + "\n".join(preview)
+    )
+
+
+def telegram_command_loop():
+    global telegram_offset, last_command_time
+
+    if not TELEGRAM_ENABLED:
+        print("Telegram command loop disabled")
+        return
+
+    print("Telegram command loop started")
+
+    while True:
+        try:
+            updates = get_telegram_updates(offset=telegram_offset, timeout=20)
+
+            for upd in updates:
+                telegram_offset = upd["update_id"] + 1
+
+                message = upd.get("message", {})
+                chat = message.get("chat", {})
+                text = str(message.get("text", "")).strip()
+                from_chat_id = str(chat.get("id", ""))
+
+                if not text:
+                    continue
+
+                # Only accept commands from your configured chat
+                if CHAT_ID and from_chat_id != str(CHAT_ID):
+                    print(f"Ignoring command from unauthorized chat: {from_chat_id}")
+                    continue
+
+                print(f"Telegram command received: {text}")
+
+                now = time.time()
+                if now - last_command_time < 1:
+                    time.sleep(1)
+                last_command_time = now
+
+                if text == "/test":
+                    send_telegram("✅ Telegram command test OK")
+
+                elif text == "/force":
+                    force_test_alerts()
+
+                elif text == "/status":
+                    send_telegram(get_status_text())
+
+                elif text == "/symbols":
+                    send_telegram(get_symbols_text())
+
+                elif text == "/help":
+                    send_telegram(
+                        "Available commands:\n"
+                        "/test - Telegram test\n"
+                        "/force - force fake alerts\n"
+                        "/status - bot status\n"
+                        "/symbols - shortlist sample\n"
+                        "/help - command list"
+                    )
+
+            time.sleep(1)
+
+        except Exception as e:
+            print("Telegram command loop error:", e)
+            time.sleep(5)
 
 
 # =========================
@@ -566,7 +722,10 @@ def scan_loop():
                 time.sleep(5)
                 continue
 
-            top_1h = get_top_gainers_from_history("60", TOP_N)
+            top_5m = get_top_gainers_from_history("5", min(TOP_N, 20))
+            top_1h = get_top_gainers_from_history("60", min(TOP_N, 20))
+
+            print("Top 5m gainers:", top_5m[:10])
             print("Top 1h gainers:", top_1h[:10])
 
             time.sleep(30)
@@ -581,11 +740,19 @@ def scan_loop():
 # =========================
 def main():
     print("Starting scanner...")
+    print("TELEGRAM_ENABLED =", TELEGRAM_ENABLED)
+    print("BOT_TOKEN set =", bool(BOT_TOKEN))
+    print("CHAT_ID set =", bool(CHAT_ID))
+    print("CATEGORY =", CATEGORY)
+    print("TOP_N =", TOP_N)
+    print("TIMEFRAMES =", TIMEFRAMES)
+
     send_telegram("🚀 Scanner started")
     send_telegram("✅ Telegram test message")
 
     threading.Thread(target=heartbeat, daemon=True).start()
     threading.Thread(target=shortlist_refresh_loop, daemon=True).start()
+    threading.Thread(target=telegram_command_loop, daemon=True).start()
 
     scan_loop()
 
