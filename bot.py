@@ -23,7 +23,7 @@ BINANCE_WS = "wss://stream.binance.com:9443/stream"
 DB_FILE = "scanner.db"
 
 VALID_INTERVALS = {"5m", "1h"}
-DEFAULT_BASELINE_CANDLES = 20
+DEFAULT_BASELINE_CANDLES = 10
 STREAM_CHUNK_SIZE = 120
 MAX_CANDLE_HISTORY = 300
 SYMBOL_REFRESH_SECONDS = 3600
@@ -34,7 +34,12 @@ MAX_TELEGRAM_RETRIES = 5
 
 TOP_ACTIVE_SYMBOL_COUNT = 20
 TOP_ALERTS_PER_MESSAGE = 5
-LEADERBOARD_DEBOUNCE_SECONDS = 15
+LEADERBOARD_DEBOUNCE_SECONDS = 12
+
+# Pump-style filters
+MIN_VOLUME_MULTIPLIER = 1.35
+BREAKOUT_LOOKBACK_CANDLES = 3
+MIN_24H_QUOTE_VOLUME_USDT = 20_000_000  # filters weak coins
 
 INTERVAL_TO_SECONDS = {
     "5m": 5 * 60,
@@ -53,6 +58,18 @@ logger = logging.getLogger("volume_scanner_bot")
 # ============================================================
 # GLOBAL STATE
 # ============================================================
+# candle dict:
+# {
+#   "open_time": int,
+#   "close_time": int,
+#   "open": float,
+#   "high": float,
+#   "low": float,
+#   "close": float,
+#   "buy": float,
+#   "sell": float,
+#   "total": float
+# }
 candle_cache: Dict[Tuple[str, str], deque] = defaultdict(lambda: deque(maxlen=MAX_CANDLE_HISTORY))
 
 ws_tasks: List[asyncio.Task] = []
@@ -72,11 +89,8 @@ shared_http_session: Optional[aiohttp.ClientSession] = None
 
 telegram_send_queue: "asyncio.Queue[Tuple[int, str]]" = asyncio.Queue()
 
-# pending leaderboards:
 # key = (rule_id, interval, candle_open_time)
 pending_leaderboards: Dict[Tuple[int, str, int], dict] = {}
-
-# once sent for a candle/rule, do not send again
 sent_leaderboards: Set[Tuple[int, str, int]] = set()
 
 restart_lock = asyncio.Lock()
@@ -167,22 +181,18 @@ def parse_kline_rest_row(row: list) -> dict:
     taker_buy_base = float(row[9])
     buy_volume = taker_buy_base
     sell_volume = max(total_volume - taker_buy_base, 0.0)
+
     return {
         "open_time": int(row[0]),
         "close_time": int(row[6]),
+        "open": float(row[1]),
+        "high": float(row[2]),
+        "low": float(row[3]),
+        "close": float(row[4]),
         "buy": buy_volume,
         "sell": sell_volume,
-        "close": float(row[4]),
+        "total": total_volume,
     }
-
-def compute_spike_percent(current_value: float, historical_values: List[float]) -> Tuple[Optional[float], Optional[float]]:
-    if not historical_values:
-        return None, None
-    avg_value = sum(historical_values) / len(historical_values)
-    if avg_value <= 0:
-        return None, None
-    spike_percent = ((current_value - avg_value) / avg_value) * 100.0
-    return spike_percent, avg_value
 
 def human_elapsed_in_candle(open_time_ms: int, interval: str) -> str:
     now_ms = int(time.time() * 1000)
@@ -193,14 +203,44 @@ def human_elapsed_in_candle(open_time_ms: int, interval: str) -> str:
     secs = elapsed_sec % 60
     return f"{mins:02d}m {secs:02d}s"
 
+def tradingview_link(symbol: str) -> str:
+    return f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"
+
 async def ensure_http_session() -> aiohttp.ClientSession:
     global shared_http_session
     if shared_http_session is None or shared_http_session.closed:
         shared_http_session = aiohttp.ClientSession()
     return shared_http_session
 
-def tradingview_link(symbol: str) -> str:
-    return f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"
+def price_change_percent(current: dict) -> Optional[float]:
+    o = current["open"]
+    c = current["close"]
+    if o <= 0:
+        return None
+    return ((c - o) / o) * 100.0
+
+def volume_multiplier(current_total: float, historical_totals: List[float]) -> Tuple[Optional[float], Optional[float]]:
+    if not historical_totals:
+        return None, None
+    avg_total = sum(historical_totals) / len(historical_totals)
+    if avg_total <= 0:
+        return None, None
+    return current_total / avg_total, avg_total
+
+def breakout_confirmed(side: str, current: dict, previous: List[dict], lookback: int = BREAKOUT_LOOKBACK_CANDLES) -> bool:
+    recent = previous[-lookback:] if len(previous) >= lookback else previous
+    if not recent:
+        return False
+
+    if side == "buy":
+        recent_high = max(c["high"] for c in recent)
+        return current["close"] > recent_high
+    else:
+        recent_low = min(c["low"] for c in recent)
+        return current["close"] < recent_low
+
+def combined_score(abs_price_pct: float, vol_mult: float) -> float:
+    return abs_price_pct * max(vol_mult, 1.0)
 
 # ============================================================
 # TELEGRAM SEND QUEUE / RATE LIMIT PROTECTION
@@ -227,28 +267,15 @@ async def telegram_sender_loop(application) -> None:
 
                 except RetryAfter as e:
                     retry_after = int(getattr(e, "retry_after", 5))
-                    logger.warning(
-                        "Telegram rate limit hit for chat_id=%s. Waiting %s seconds before retry.",
-                        chat_id,
-                        retry_after,
-                    )
+                    logger.warning("Telegram rate limit hit for chat_id=%s. Waiting %s seconds.", chat_id, retry_after)
                     await asyncio.sleep(retry_after + 1)
 
                 except (TimedOut, NetworkError) as e:
-                    logger.warning(
-                        "Temporary Telegram network error for chat_id=%s: %s. Retrying in 3 seconds.",
-                        chat_id,
-                        e,
-                    )
+                    logger.warning("Temporary Telegram network error for chat_id=%s: %s", chat_id, e)
                     await asyncio.sleep(3)
 
                 except Exception as e:
-                    logger.warning(
-                        "Failed sending Telegram alert to chat_id=%s on attempt %s: %s",
-                        chat_id,
-                        attempt,
-                        e,
-                    )
+                    logger.warning("Failed sending Telegram alert to chat_id=%s on attempt %s: %s", chat_id, attempt, e)
                     await asyncio.sleep(2)
 
             if not sent:
@@ -324,11 +351,15 @@ async def fetch_top_active_usdt_symbols(force: bool = False, limit: int = TOP_AC
     ranked = []
     for row in data:
         symbol = row.get("symbol")
-        if symbol in valid_symbols:
-            try:
-                quote_volume = float(row.get("quoteVolume", 0.0))
-            except (TypeError, ValueError):
-                quote_volume = 0.0
+        if symbol not in valid_symbols:
+            continue
+
+        try:
+            quote_volume = float(row.get("quoteVolume", 0.0))
+        except (TypeError, ValueError):
+            quote_volume = 0.0
+
+        if quote_volume >= MIN_24H_QUOTE_VOLUME_USDT:
             ranked.append((symbol, quote_volume))
 
     ranked.sort(key=lambda x: x[1], reverse=True)
@@ -348,17 +379,16 @@ async def fetch_klines(symbol: str, interval: str, limit: int) -> List[list]:
     }
     async with session.get(f"{BINANCE_REST}/api/v3/klines", params=params) as resp:
         resp.raise_for_status()
-        data = await resp.json()
-        return data
+        return await resp.json()
 
 async def preload_symbol_history(symbol: str, interval: str, needed_closed_candles: int) -> None:
     key = (symbol, interval)
     existing = candle_cache[key]
-    if len(existing) >= needed_closed_candles + 2:
+    if len(existing) >= needed_closed_candles + 5:
         return
 
     try:
-        rows = await fetch_klines(symbol, interval, limit=max(needed_closed_candles + 5, 30))
+        rows = await fetch_klines(symbol, interval, limit=max(needed_closed_candles + 10, 30))
         parsed = [parse_kline_rest_row(r) for r in rows]
         dq = candle_cache[key]
         dq.clear()
@@ -417,8 +447,9 @@ def add_leaderboard_candidate(
     symbol: str,
     interval: str,
     current: dict,
-    avg_value: float,
-    spike_pct: float,
+    price_pct: float,
+    vol_mult: float,
+    avg_total_volume: float,
 ) -> None:
     bucket_key = (rule["id"], interval, current["open_time"])
 
@@ -440,13 +471,17 @@ def add_leaderboard_candidate(
         }
         pending_leaderboards[bucket_key] = bucket
 
+    score = combined_score(abs(price_pct), vol_mult)
+
     existing = bucket["candidates"].get(symbol)
-    if existing is None or spike_pct > existing["spike_pct"]:
+    if existing is None or score > existing["score"]:
         bucket["candidates"][symbol] = {
             "symbol": symbol,
-            "spike_pct": spike_pct,
-            "current_value": current[rule["side"]],
-            "avg_value": avg_value,
+            "score": score,
+            "price_pct": price_pct,
+            "vol_mult": vol_mult,
+            "current_total_volume": current["total"],
+            "avg_total_volume": avg_total_volume,
             "close": current["close"],
             "elapsed": human_elapsed_in_candle(current["open_time"], interval),
             "chart": tradingview_link(symbol),
@@ -466,26 +501,30 @@ async def leaderboard_dispatcher_loop(application) -> None:
 
             for bucket_key, bucket in to_send:
                 candidates = list(bucket["candidates"].values())
-                candidates.sort(key=lambda x: x["spike_pct"], reverse=True)
+                candidates.sort(key=lambda x: x["score"], reverse=True)
                 top_candidates = candidates[:TOP_ALERTS_PER_MESSAGE]
 
                 if not top_candidates:
                     pending_leaderboards.pop(bucket_key, None)
                     continue
 
+                direction_word = "PUMPS" if bucket["side"] == "buy" else "DUMPS"
                 header = (
-                    f"🔥 TOP {len(top_candidates)} {bucket['side'].upper()} VOLUME SPIKES ({bucket['interval']})\n\n"
-                    f"Threshold: {bucket['threshold']:.2f}%\n"
+                    f"🚀 TOP {len(top_candidates)} {direction_word} ({bucket['interval']})\n\n"
+                    f"Min price move: {bucket['threshold']:.2f}%\n"
+                    f"Min volume multiplier: {MIN_VOLUME_MULTIPLIER:.2f}x\n"
                     f"Baseline: last {bucket['baseline_candles']} candles\n"
-                    f"Universe: top {TOP_ACTIVE_SYMBOL_COUNT} active USDT symbols or your custom list\n"
+                    f"Universe: top {TOP_ACTIVE_SYMBOL_COUNT} active USDT coins or your custom list\n"
                 )
 
                 lines = []
                 for idx, item in enumerate(top_candidates, start=1):
                     lines.append(
-                        f"\n{idx}. {item['symbol']}  +{item['spike_pct']:.2f}%\n"
-                        f"Live {bucket['side']} vol: {item['current_value']:,.6f}\n"
-                        f"Avg {bucket['side']} vol: {item['avg_value']:,.6f}\n"
+                        f"\n{idx}. {item['symbol']}\n"
+                        f"Price move: {item['price_pct']:+.2f}%\n"
+                        f"Volume surge: {item['vol_mult']:.2f}x\n"
+                        f"Live volume: {item['current_total_volume']:,.2f}\n"
+                        f"Avg volume: {item['avg_total_volume']:,.2f}\n"
                         f"Price: {item['close']}\n"
                         f"Elapsed: {item['elapsed']}\n"
                         f"Chart: {item['chart']}"
@@ -550,33 +589,43 @@ async def evaluate_live_candle(application, symbol: str, interval: str, live_can
                 continue
 
         side = rule["side"]
-        threshold = rule["threshold_percent"]
+        min_price_move = rule["threshold_percent"]
         baseline_candles = rule["baseline_candles"]
 
         key = (symbol, interval)
         candles = list(candle_cache[key])
 
-        if len(candles) < baseline_candles + 1:
+        if len(candles) < baseline_candles + BREAKOUT_LOOKBACK_CANDLES + 1:
             continue
 
         current = candles[-1]
         previous = candles[-(baseline_candles + 1):-1]
+        historical_totals = [c["total"] for c in previous]
 
-        current_value = current[side]
-        previous_values = [c[side] for c in previous]
-
-        spike_pct, avg_value = compute_spike_percent(current_value, previous_values)
-        if spike_pct is None or avg_value is None:
+        pct = price_change_percent(current)
+        if pct is None:
             continue
 
-        if spike_pct >= threshold:
+        vol_mult, avg_total_volume = volume_multiplier(current["total"], historical_totals)
+        if vol_mult is None or avg_total_volume is None:
+            continue
+
+        breakout_ok = breakout_confirmed(side, current, previous, BREAKOUT_LOOKBACK_CANDLES)
+
+        if side == "buy":
+            direction_ok = pct >= min_price_move
+        else:
+            direction_ok = pct <= -min_price_move
+
+        if direction_ok and vol_mult >= MIN_VOLUME_MULTIPLIER and breakout_ok:
             add_leaderboard_candidate(
                 rule=rule,
                 symbol=symbol,
                 interval=interval,
                 current=current,
-                avg_value=avg_value,
-                spike_pct=spike_pct,
+                price_pct=pct,
+                vol_mult=vol_mult,
+                avg_total_volume=avg_total_volume,
             )
 
 # ============================================================
@@ -602,14 +651,12 @@ async def websocket_worker(application, interval: str, symbols: List[str]) -> No
                     payload = json.loads(msg.data)
                     data = payload.get("data", {})
                     k = data.get("k")
-
                     if not k:
                         continue
 
                     symbol = k["s"]
                     open_time = int(k["t"])
                     close_time = int(k["T"])
-                    close_price = float(k["c"])
 
                     total_volume = float(k["v"])
                     taker_buy_base = float(k["V"])
@@ -620,9 +667,13 @@ async def websocket_worker(application, interval: str, symbols: List[str]) -> No
                     live_candle = {
                         "open_time": open_time,
                         "close_time": close_time,
+                        "open": float(k["o"]),
+                        "high": float(k["h"]),
+                        "low": float(k["l"]),
+                        "close": float(k["c"]),
                         "buy": buy_volume,
                         "sell": sell_volume,
-                        "close": close_price,
+                        "total": total_volume,
                     }
 
                     cache_key = (symbol, interval)
@@ -672,7 +723,7 @@ async def restart_streams(application) -> None:
 # TELEGRAM COMMANDS
 # ============================================================
 HELP_TEXT = f"""
-Volume Spike Scanner Bot
+Pump-Style Momentum Scanner Bot
 
 Commands:
 
@@ -687,15 +738,25 @@ Commands:
 Examples:
 
 /test_alert
-/add_rule 5m buy 10 20 ALL_USDT
-/add_rule 1h buy 7.5 20 ALL_USDT
-/add_rule 5m sell 12 15 BTCUSDT,ETHUSDT,SOLUSDT
+/add_rule 5m buy 1.0 5 ALL_USDT
+/add_rule 5m buy 1.2 5 BTCUSDT,ETHUSDT,SOLUSDT
+/add_rule 5m sell 1.0 5 ALL_USDT
 
-Notes:
-- ALL_USDT now means smart mode: top {TOP_ACTIVE_SYMBOL_COUNT} active USDT spot symbols
-- Alerts are live, not close-candle only
-- Alerts are ranked into one top {TOP_ALERTS_PER_MESSAGE} message
-- Next alert for the same rule comes from the next candle
+How rules work now:
+- threshold_percent = minimum price move % in the current candle
+- baseline_candles = number of previous candles for average volume
+- side=buy detects pumps
+- side=sell detects dumps
+- ALL_USDT = top {TOP_ACTIVE_SYMBOL_COUNT} active USDT spot coins
+
+Built-in filters:
+- min volume surge = {MIN_VOLUME_MULTIPLIER:.2f}x
+- breakout lookback = last {BREAKOUT_LOOKBACK_CANDLES} candles
+- min 24h quote volume = {MIN_24H_QUOTE_VOLUME_USDT:,.0f} USDT
+
+Alerts:
+- ranked into top {TOP_ALERTS_PER_MESSAGE} message
+- live, not close-candle only
 """
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -711,17 +772,14 @@ async def test_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     msg = (
         "🧪 TEST ALERT\n\n"
         "Symbol: BTCUSDT\n"
+        "Price move: +1.42%\n"
+        "Volume surge: 2.18x\n"
         "Interval: 5m\n"
-        "Threshold: 5.00%\n"
-        "Baseline: last 10 candles\n"
-        "Live buy volume: 12345.678900\n"
-        "Average buy volume: 10000.000000\n"
-        "Spike: +23.46%\n"
+        "Baseline: last 5 candles\n"
         "Price: 65000.00\n"
         "Elapsed in candle: 01m 12s\n"
         f"Chart: {tradingview_link('BTCUSDT')}"
     )
-
     await reply_text_safe(update, msg)
 
 async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -737,8 +795,8 @@ async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "Usage:\n"
             "/add_rule <interval> <side> <threshold_percent> <baseline_candles> <ALL_USDT or symbols>\n\n"
             "Examples:\n"
-            "/add_rule 5m buy 10 20 ALL_USDT\n"
-            "/add_rule 1h sell 12.5 20 BTCUSDT,ETHUSDT"
+            "/add_rule 5m buy 1.0 5 ALL_USDT\n"
+            "/add_rule 5m sell 1.0 5 BTCUSDT,ETHUSDT"
         )
         return
 
@@ -766,8 +824,8 @@ async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await reply_text_safe(update, "Threshold must be greater than 0.")
         return
 
-    if baseline_candles < 1:
-        await reply_text_safe(update, "Baseline candles must be at least 1.")
+    if baseline_candles < 2:
+        await reply_text_safe(update, "Baseline candles must be at least 2.")
         return
 
     if symbol_input.upper() == "ALL_USDT":
@@ -801,15 +859,16 @@ async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await db.commit()
 
     scope_text = f"TOP {TOP_ACTIVE_SYMBOL_COUNT} ACTIVE USDT COINS" if symbols_mode == "ALL_USDT" else symbol_input.upper()
+
     await reply_text_safe(
         update,
-        "Rule added successfully!\n\n"
+        "Pump-style rule added successfully!\n\n"
         f"Interval: {interval}\n"
         f"Side: {side}\n"
-        f"Threshold: {threshold_percent}%\n"
-        f"Baseline candles: {baseline_candles}\n"
+        f"Min price move: {threshold_percent}%\n"
+        f"Volume baseline: last {baseline_candles} candles\n"
         f"Symbols: {scope_text}\n"
-        f"Mode: top {TOP_ALERTS_PER_MESSAGE} ranked alerts"
+        f"Filters: volume >= {MIN_VOLUME_MULTIPLIER:.2f}x + breakout/breakdown confirmation"
     )
 
     asyncio.create_task(restart_streams(context.application))
@@ -835,7 +894,7 @@ async def list_rules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         enabled_text = "ON" if r["enabled"] else "OFF"
         lines.append(
             f"ID {r['id']} | {enabled_text} | {r['interval']} | {r['side']} | "
-            f"{r['threshold_percent']}% | baseline {r['baseline_candles']} | {symbols_text}"
+            f"min move {r['threshold_percent']}% | baseline {r['baseline_candles']} | {symbols_text}"
         )
 
     await reply_text_safe(update, "\n".join(lines))
