@@ -21,11 +21,6 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 BINANCE_REST = "https://api.binance.com"
 BINANCE_WS = "wss://stream.binance.com:9443/stream"
 
-# Railway-safe defaults.
-# You can still override with env vars:
-#   DB_DIR=/app/data
-# or
-#   DB_FILE=/app/data/scanner.db
 DEFAULT_DB_DIR = os.getenv("DB_DIR", "/app/data").strip()
 DB_FILE = os.getenv("DB_FILE", os.path.join(DEFAULT_DB_DIR, "scanner.db")).strip()
 
@@ -43,12 +38,10 @@ TOP_ACTIVE_SYMBOL_COUNT = 20
 TOP_ALERTS_PER_MESSAGE = 5
 LEADERBOARD_DEBOUNCE_SECONDS = 12
 
-# Pump-style filters
 MIN_VOLUME_MULTIPLIER = 1.1
 BREAKOUT_LOOKBACK_CANDLES = 1
 MIN_24H_QUOTE_VOLUME_USDT = 20_000_000
 
-# Debug logging for why alerts do or do not trigger
 ENABLE_EVALUATION_DEBUG_LOGS = True
 
 INTERVAL_TO_SECONDS = {
@@ -88,11 +81,14 @@ shared_http_session: Optional[aiohttp.ClientSession] = None
 
 telegram_send_queue: "asyncio.Queue[Tuple[int, str]]" = asyncio.Queue()
 
-# key = (rule_id, interval, candle_open_time)
 pending_leaderboards: Dict[Tuple[int, str, int], dict] = {}
 sent_leaderboards: Set[Tuple[int, str, int]] = set()
 
 restart_lock = asyncio.Lock()
+rules_lock = asyncio.Lock()
+
+# In-memory rule cache
+rules_cache: List[dict] = []
 
 # ============================================================
 # DATABASE
@@ -139,10 +135,7 @@ def ensure_db_path() -> str:
 async def connect_db() -> aiosqlite.Connection:
     db_path = ensure_db_path()
     logger.info("Connecting to SQLite DB: %s", db_path)
-
     db = await aiosqlite.connect(db_path, timeout=30)
-    await db.execute("PRAGMA journal_mode=WAL;")
-    await db.execute("PRAGMA synchronous=NORMAL;")
     await db.execute("PRAGMA foreign_keys=ON;")
     return db
 
@@ -159,13 +152,14 @@ async def init_db() -> None:
         logger.exception("init_db failed")
         raise
 
-async def get_all_rules() -> List[dict]:
+async def fetch_rules_from_db() -> List[dict]:
     async with await connect_db() as db:
         cur = await db.execute("""
             SELECT id, chat_id, enabled, interval, side, threshold_percent,
                    baseline_candles, symbols_mode, symbols_json
             FROM rules
             WHERE enabled = 1
+            ORDER BY id DESC
         """)
         rows = await cur.fetchall()
         await cur.close()
@@ -185,31 +179,19 @@ async def get_all_rules() -> List[dict]:
         })
     return rules
 
-async def get_chat_rules(chat_id: int) -> List[dict]:
-    async with await connect_db() as db:
-        cur = await db.execute("""
-            SELECT id, enabled, interval, side, threshold_percent,
-                   baseline_candles, symbols_mode, symbols_json
-            FROM rules
-            WHERE chat_id = ?
-            ORDER BY id DESC
-        """, (chat_id,))
-        rows = await cur.fetchall()
-        await cur.close()
+async def refresh_rules_cache() -> None:
+    global rules_cache
+    async with rules_lock:
+        rules_cache = await fetch_rules_from_db()
+        logger.info("Rules cache refreshed: %d enabled rule(s)", len(rules_cache))
 
-    rules = []
-    for row in rows:
-        rules.append({
-            "id": int(row[0]),
-            "enabled": bool(row[1]),
-            "interval": row[2],
-            "side": row[3],
-            "threshold_percent": float(row[4]),
-            "baseline_candles": int(row[5]),
-            "symbols_mode": row[6],
-            "symbols": json.loads(row[7]) if row[7] else [],
-        })
-    return rules
+async def get_all_rules() -> List[dict]:
+    async with rules_lock:
+        return list(rules_cache)
+
+async def get_chat_rules(chat_id: int) -> List[dict]:
+    rules = await get_all_rules()
+    return [r for r in rules if r["chat_id"] == chat_id]
 
 # ============================================================
 # HELPERS
@@ -288,7 +270,7 @@ def combined_score(abs_price_pct: float, vol_mult: float) -> float:
     return abs_price_pct * max(vol_mult, 1.0)
 
 # ============================================================
-# TELEGRAM SEND QUEUE / RATE LIMIT PROTECTION
+# TELEGRAM SEND QUEUE
 # ============================================================
 async def enqueue_telegram_message(chat_id: int, text: str) -> None:
     await telegram_send_queue.put((chat_id, text))
@@ -347,7 +329,6 @@ async def reply_text_safe(update: Update, text: str) -> None:
         await update.message.reply_text(text, disable_web_page_preview=True)
     except RetryAfter as e:
         retry_after = int(getattr(e, "retry_after", 5))
-        logger.warning("Direct reply rate-limited. Waiting %s seconds.", retry_after)
         await asyncio.sleep(retry_after + 1)
         await update.message.reply_text(text, disable_web_page_preview=True)
     except Exception as e:
@@ -421,11 +402,7 @@ async def fetch_top_active_usdt_symbols(force: bool = False, limit: int = TOP_AC
 
 async def fetch_klines(symbol: str, interval: str, limit: int) -> List[list]:
     session = await ensure_http_session()
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit,
-    }
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
     async with session.get(f"{BINANCE_REST}/api/v3/klines", params=params) as resp:
         resp.raise_for_status()
         return await resp.json()
@@ -481,14 +458,8 @@ async def rebuild_tracking_map() -> None:
 
         logger.info(
             "Rule %s loaded | chat=%s | interval=%s | side=%s | threshold=%.3f | baseline=%d | mode=%s | symbols=%d",
-            rule["id"],
-            rule["chat_id"],
-            rule["interval"],
-            rule["side"],
-            rule["threshold_percent"],
-            rule["baseline_candles"],
-            rule["symbols_mode"],
-            len(symbols),
+            rule["id"], rule["chat_id"], rule["interval"], rule["side"],
+            rule["threshold_percent"], rule["baseline_candles"], rule["symbols_mode"], len(symbols)
         )
 
         for sym in symbols:
@@ -506,7 +477,7 @@ async def rebuild_tracking_map() -> None:
             await asyncio.gather(*batch, return_exceptions=True)
 
 # ============================================================
-# LEADERBOARD ALERTS
+# LEADERBOARD
 # ============================================================
 def add_leaderboard_candidate(
     rule: dict,
@@ -600,9 +571,7 @@ async def leaderboard_dispatcher_loop(application) -> None:
                         f"Chart: {item['chart']}"
                     )
 
-                msg = header + "".join(lines)
-
-                await enqueue_telegram_message(bucket["chat_id"], msg)
+                await enqueue_telegram_message(bucket["chat_id"], header + "".join(lines))
                 sent_leaderboards.add(bucket_key)
                 pending_leaderboards.pop(bucket_key, None)
 
@@ -659,23 +628,14 @@ async def evaluate_live_candle(symbol: str, interval: str) -> None:
             if symbol not in allowed_symbols:
                 continue
 
+        baseline_candles = rule["baseline_candles"]
         side = rule["side"]
         min_price_move = rule["threshold_percent"]
-        baseline_candles = rule["baseline_candles"]
 
         key = (symbol, interval)
         candles = list(candle_cache[key])
 
         if len(candles) < baseline_candles + BREAKOUT_LOOKBACK_CANDLES + 1:
-            if ENABLE_EVALUATION_DEBUG_LOGS:
-                logger.info(
-                    "SKIP %s %s | rule=%s | reason=not_enough_candles | have=%d | need=%d",
-                    symbol,
-                    interval,
-                    rule["id"],
-                    len(candles),
-                    baseline_candles + BREAKOUT_LOOKBACK_CANDLES + 1,
-                )
             continue
 
         current = candles[-1]
@@ -684,14 +644,10 @@ async def evaluate_live_candle(symbol: str, interval: str) -> None:
 
         pct = price_change_percent(current)
         if pct is None:
-            if ENABLE_EVALUATION_DEBUG_LOGS:
-                logger.info("SKIP %s %s | rule=%s | reason=pct_none", symbol, interval, rule["id"])
             continue
 
         vol_mult, avg_total_volume = volume_multiplier(current["total"], historical_totals)
         if vol_mult is None or avg_total_volume is None:
-            if ENABLE_EVALUATION_DEBUG_LOGS:
-                logger.info("SKIP %s %s | rule=%s | reason=vol_mult_none", symbol, interval, rule["id"])
             continue
 
         breakout_ok = breakout_confirmed(side, current, previous, BREAKOUT_LOOKBACK_CANDLES)
@@ -703,17 +659,8 @@ async def evaluate_live_candle(symbol: str, interval: str) -> None:
 
         if ENABLE_EVALUATION_DEBUG_LOGS:
             logger.info(
-                "CHECK %s %s | rule=%s | side=%s | pct=%.3f | min=%.3f | vol_mult=%.3f | breakout=%s | total=%.3f | avg=%.3f",
-                symbol,
-                interval,
-                rule["id"],
-                side,
-                pct,
-                min_price_move,
-                vol_mult,
-                breakout_ok,
-                current["total"],
-                avg_total_volume,
+                "CHECK %s %s | rule=%s | side=%s | pct=%.3f | min=%.3f | vol_mult=%.3f | breakout=%s",
+                symbol, interval, rule["id"], side, pct, min_price_move, vol_mult, breakout_ok
             )
 
         if direction_ok and vol_mult >= MIN_VOLUME_MULTIPLIER and breakout_ok:
@@ -732,7 +679,7 @@ async def evaluate_live_candle(symbol: str, interval: str) -> None:
             )
 
 # ============================================================
-# WEBSOCKET STREAMS
+# WEBSOCKET
 # ============================================================
 async def websocket_worker(interval: str, symbols: List[str]) -> None:
     if not symbols:
@@ -758,7 +705,6 @@ async def websocket_worker(interval: str, symbols: List[str]) -> None:
                         continue
 
                     symbol = k["s"]
-
                     total_volume = float(k["v"])
                     taker_buy_base = float(k["V"])
 
@@ -803,6 +749,7 @@ async def restart_streams() -> None:
 
         ws_tasks = []
 
+        await refresh_rules_cache()
         await rebuild_tracking_map()
 
         if not tracked_symbols_by_interval:
@@ -818,7 +765,7 @@ async def restart_streams() -> None:
         logger.info("Started %d websocket task(s)", len(ws_tasks))
 
 # ============================================================
-# TELEGRAM COMMANDS
+# COMMANDS
 # ============================================================
 HELP_TEXT = f"""
 Pump-Style Momentum Scanner Bot
@@ -832,29 +779,6 @@ Commands:
 /list_rules
 /delete_rule <rule_id>
 /reload
-
-Examples:
-
-/test_alert
-/add_rule 5m buy 1.0 5 ALL_USDT
-/add_rule 5m buy 1.2 5 BTCUSDT,ETHUSDT,SOLUSDT
-/add_rule 5m sell 1.0 5 ALL_USDT
-
-How rules work now:
-- threshold_percent = minimum price move % in the current candle
-- baseline_candles = number of previous candles for average volume
-- side=buy detects pumps
-- side=sell detects dumps
-- ALL_USDT = top {TOP_ACTIVE_SYMBOL_COUNT} active USDT spot coins
-
-Built-in filters:
-- min volume surge = {MIN_VOLUME_MULTIPLIER:.2f}x
-- breakout lookback = last {BREAKOUT_LOOKBACK_CANDLES} candles
-- min 24h quote volume = {MIN_24H_QUOTE_VOLUME_USDT:,.0f} USDT
-
-Alerts:
-- ranked into top {TOP_ALERTS_PER_MESSAGE} message
-- live, not close-candle only
 """
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -888,14 +812,7 @@ async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     args = context.args
 
     if len(args) < 5:
-        await reply_text_safe(
-            update,
-            "Usage:\n"
-            "/add_rule <interval> <side> <threshold_percent> <baseline_candles> <ALL_USDT or symbols>\n\n"
-            "Examples:\n"
-            "/add_rule 5m buy 1.0 5 ALL_USDT\n"
-            "/add_rule 5m sell 1.0 5 BTCUSDT,ETHUSDT"
-        )
+        await reply_text_safe(update, "Usage:\n/add_rule <interval> <side> <threshold_percent> <baseline_candles> <ALL_USDT or symbols>")
         return
 
     interval = args[0].strip()
@@ -934,7 +851,6 @@ async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if not symbols:
             await reply_text_safe(update, "Please provide at least one symbol or use ALL_USDT.")
             return
-
         symbols_mode = "CUSTOM"
         symbols_json = json.dumps(symbols)
 
@@ -946,29 +862,13 @@ async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             VALUES (?, 1, ?, ?, ?, ?, ?, ?)
         """, (
-            chat_id,
-            interval,
-            side,
-            threshold_percent,
-            baseline_candles,
-            symbols_mode,
-            symbols_json
+            chat_id, interval, side, threshold_percent,
+            baseline_candles, symbols_mode, symbols_json
         ))
         await db.commit()
 
-    scope_text = f"TOP {TOP_ACTIVE_SYMBOL_COUNT} ACTIVE USDT COINS" if symbols_mode == "ALL_USDT" else symbol_input.upper()
-
-    await reply_text_safe(
-        update,
-        "Pump-style rule added successfully!\n\n"
-        f"Interval: {interval}\n"
-        f"Side: {side}\n"
-        f"Min price move: {threshold_percent}%\n"
-        f"Volume baseline: last {baseline_candles} candles\n"
-        f"Symbols: {scope_text}\n"
-        f"Filters: volume >= {MIN_VOLUME_MULTIPLIER:.2f}x + breakout/breakdown confirmation"
-    )
-
+    await refresh_rules_cache()
+    await reply_text_safe(update, "Rule added successfully.")
     asyncio.create_task(restart_streams())
 
 async def list_rules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -984,15 +884,9 @@ async def list_rules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     lines = []
     for r in rules:
-        symbols_text = (
-            f"TOP {TOP_ACTIVE_SYMBOL_COUNT} ACTIVE USDT"
-            if r["symbols_mode"] == "ALL_USDT"
-            else ",".join(r["symbols"])
-        )
-        enabled_text = "ON" if r["enabled"] else "OFF"
+        symbols_text = "TOP 20 ACTIVE USDT" if r["symbols_mode"] == "ALL_USDT" else ",".join(r["symbols"])
         lines.append(
-            f"ID {r['id']} | {enabled_text} | {r['interval']} | {r['side']} | "
-            f"min move {r['threshold_percent']}% | baseline {r['baseline_candles']} | {symbols_text}"
+            f"ID {r['id']} | {r['interval']} | {r['side']} | min move {r['threshold_percent']}% | baseline {r['baseline_candles']} | {symbols_text}"
         )
 
     await reply_text_safe(update, "\n".join(lines))
@@ -1024,18 +918,12 @@ async def delete_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await reply_text_safe(update, "Rule not found.")
         return
 
-    keys_to_remove = [k for k, v in pending_leaderboards.items() if v["rule_id"] == rule_id]
-    for k in keys_to_remove:
-        pending_leaderboards.pop(k, None)
-
-    sent_to_remove = {k for k in sent_leaderboards if k[0] == rule_id}
-    if sent_to_remove:
-        sent_leaderboards.difference_update(sent_to_remove)
-
+    await refresh_rules_cache()
     await reply_text_safe(update, f"Deleted rule {rule_id}.")
     asyncio.create_task(restart_streams())
 
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await refresh_rules_cache()
     await reply_text_safe(update, "Scanner reloading...")
     asyncio.create_task(restart_streams())
 
@@ -1043,7 +931,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.exception("Unhandled exception: %s", context.error)
 
 # ============================================================
-# BACKGROUND MAINTENANCE
+# MAINTENANCE
 # ============================================================
 async def maintenance_loop() -> None:
     while True:
@@ -1075,6 +963,7 @@ async def post_init(application) -> None:
     global maintenance_task, telegram_sender_task, leaderboard_dispatcher_task, delayed_start_task
 
     await init_db()
+    await refresh_rules_cache()
 
     telegram_sender_task = asyncio.create_task(telegram_sender_loop(application))
     leaderboard_dispatcher_task = asyncio.create_task(leaderboard_dispatcher_loop(application))
@@ -1107,11 +996,6 @@ async def cleanup_background_tasks() -> None:
         *[t for t in [maintenance_task, telegram_sender_task, leaderboard_dispatcher_task, delayed_start_task] if t],
         return_exceptions=True,
     )
-
-    maintenance_task = None
-    telegram_sender_task = None
-    leaderboard_dispatcher_task = None
-    delayed_start_task = None
 
     if shared_http_session and not shared_http_session.closed:
         await shared_http_session.close()
