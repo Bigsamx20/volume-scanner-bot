@@ -26,8 +26,8 @@ TIMEFRAMES = ["60"]
 # =========================
 # DEFAULT SETTINGS FOR ALL SYMBOLS
 # RSI defaults:
-# overbought = 80
-# oversold = 25
+# overbought = 75
+# oversold = 30
 # EMA200 settings unchanged
 # =========================
 TIMEFRAME_DEFAULTS = {
@@ -41,8 +41,8 @@ TIMEFRAME_DEFAULTS = {
         "ema_distance": {
             "enabled": True,
             "ema_length": 200,
-            "above_percent": 2.0,
-            "below_percent": -2.0,
+            "above_percent": 1.5,
+            "below_percent": -1.5,
         },
     },
 }
