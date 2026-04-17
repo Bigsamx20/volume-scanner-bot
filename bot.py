@@ -4,6 +4,7 @@ import time
 import asyncio
 import logging
 from collections import defaultdict, deque
+from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set
 
 import aiohttp
@@ -20,7 +21,11 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 BINANCE_REST = "https://api.binance.com"
 BINANCE_WS = "wss://stream.binance.com:9443/stream"
 
-DB_FILE = "/data/scanner.db"
+# Prefer DB_FILE if explicitly set.
+# Otherwise use DB_DIR/scanner.db.
+# Default is ./data/scanner.db which works on most hosts.
+DEFAULT_DB_DIR = os.getenv("DB_DIR", "./data").strip()
+DB_FILE = os.getenv("DB_FILE", os.path.join(DEFAULT_DB_DIR, "scanner.db")).strip()
 
 VALID_INTERVALS = {"5m", "1h"}
 DEFAULT_BASELINE_CANDLES = 10
@@ -39,7 +44,7 @@ LEADERBOARD_DEBOUNCE_SECONDS = 12
 # Pump-style filters
 MIN_VOLUME_MULTIPLIER = 1.1
 BREAKOUT_LOOKBACK_CANDLES = 1
-MIN_24H_QUOTE_VOLUME_USDT = 20_000_000  # filters weak coins
+MIN_24H_QUOTE_VOLUME_USDT = 20_000_000
 
 INTERVAL_TO_SECONDS = {
     "5m": 5 * 60,
@@ -58,32 +63,21 @@ logger = logging.getLogger("volume_scanner_bot")
 # ============================================================
 # GLOBAL STATE
 # ============================================================
-# candle dict:
-# {
-#   "open_time": int,
-#   "close_time": int,
-#   "open": float,
-#   "high": float,
-#   "low": float,
-#   "close": float,
-#   "buy": float,
-#   "sell": float,
-#   "total": float
-# }
 candle_cache: Dict[Tuple[str, str], deque] = defaultdict(lambda: deque(maxlen=MAX_CANDLE_HISTORY))
 
 ws_tasks: List[asyncio.Task] = []
 maintenance_task: Optional[asyncio.Task] = None
 telegram_sender_task: Optional[asyncio.Task] = None
 leaderboard_dispatcher_task: Optional[asyncio.Task] = None
+delayed_start_task: Optional[asyncio.Task] = None
 
 tracked_symbols_by_interval: Dict[str, Set[str]] = defaultdict(set)
 
 all_usdt_symbols_cache: List[str] = []
-all_usdt_symbols_last_refresh = 0
+all_usdt_symbols_last_refresh = 0.0
 
 top_active_usdt_symbols_cache: List[str] = []
-top_active_usdt_symbols_last_refresh = 0
+top_active_usdt_symbols_last_refresh = 0.0
 
 shared_http_session: Optional[aiohttp.ClientSession] = None
 
@@ -112,13 +106,41 @@ CREATE TABLE IF NOT EXISTS rules (
 );
 """
 
+def ensure_db_path() -> str:
+    db_path = Path(DB_FILE).expanduser()
+    db_dir = db_path.parent
+
+    db_dir.mkdir(parents=True, exist_ok=True)
+
+    test_file = db_dir / ".write_test"
+    try:
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write("ok")
+        test_file.unlink(missing_ok=True)
+    except Exception as e:
+        raise RuntimeError(
+            f"Database directory is not writable: {db_dir}. "
+            f"Set DB_FILE or DB_DIR to a writable location. Original error: {e}"
+        ) from e
+
+    return str(db_path.resolve())
+
+async def connect_db() -> aiosqlite.Connection:
+    db_path = ensure_db_path()
+    db = await aiosqlite.connect(db_path, timeout=30)
+    await db.execute("PRAGMA journal_mode=WAL;")
+    await db.execute("PRAGMA synchronous=NORMAL;")
+    await db.execute("PRAGMA foreign_keys=ON;")
+    return db
+
 async def init_db() -> None:
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with await connect_db() as db:
         await db.execute(CREATE_RULES_SQL)
         await db.commit()
+    logger.info("Database initialized at %s", ensure_db_path())
 
 async def get_all_rules() -> List[dict]:
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with await connect_db() as db:
         cur = await db.execute("""
             SELECT id, chat_id, enabled, interval, side, threshold_percent,
                    baseline_candles, symbols_mode, symbols_json
@@ -126,6 +148,7 @@ async def get_all_rules() -> List[dict]:
             WHERE enabled = 1
         """)
         rows = await cur.fetchall()
+        await cur.close()
 
     rules = []
     for row in rows:
@@ -143,7 +166,7 @@ async def get_all_rules() -> List[dict]:
     return rules
 
 async def get_chat_rules(chat_id: int) -> List[dict]:
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with await connect_db() as db:
         cur = await db.execute("""
             SELECT id, enabled, interval, side, threshold_percent,
                    baseline_candles, symbols_mode, symbols_json
@@ -152,6 +175,7 @@ async def get_chat_rules(chat_id: int) -> List[dict]:
             ORDER BY id DESC
         """, (chat_id,))
         rows = await cur.fetchall()
+        await cur.close()
 
     rules = []
     for row in rows:
@@ -209,7 +233,8 @@ def tradingview_link(symbol: str) -> str:
 async def ensure_http_session() -> aiohttp.ClientSession:
     global shared_http_session
     if shared_http_session is None or shared_http_session.closed:
-        shared_http_session = aiohttp.ClientSession()
+        timeout = aiohttp.ClientTimeout(total=30)
+        shared_http_session = aiohttp.ClientSession(timeout=timeout)
     return shared_http_session
 
 def price_change_percent(current: dict) -> Optional[float]:
@@ -260,7 +285,11 @@ async def telegram_sender_loop(application) -> None:
             while not sent and attempt < MAX_TELEGRAM_RETRIES:
                 attempt += 1
                 try:
-                    await application.bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
+                    await application.bot.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        disable_web_page_preview=True,
+                    )
                     sent = True
                     logger.info("Telegram alert sent to chat_id=%s", chat_id)
                     await asyncio.sleep(MIN_TELEGRAM_SEND_DELAY_SECONDS)
@@ -840,7 +869,7 @@ async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         symbols_mode = "CUSTOM"
         symbols_json = json.dumps(symbols)
 
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with await connect_db() as db:
         await db.execute("""
             INSERT INTO rules (
                 chat_id, enabled, interval, side, threshold_percent,
@@ -916,10 +945,11 @@ async def delete_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await reply_text_safe(update, "Rule ID must be a number.")
         return
 
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with await connect_db() as db:
         cur = await db.execute("DELETE FROM rules WHERE id = ? AND chat_id = ?", (rule_id, chat_id))
         await db.commit()
         deleted = cur.rowcount
+        await cur.close()
 
     if deleted == 0:
         await reply_text_safe(update, "Rule not found.")
@@ -961,6 +991,9 @@ async def maintenance_loop(application) -> None:
             else:
                 await fetch_top_active_usdt_symbols(force=False)
 
+        except asyncio.CancelledError:
+            logger.info("Maintenance loop cancelled.")
+            raise
         except Exception as e:
             logger.warning("Maintenance loop error: %s", e)
 
@@ -970,56 +1003,66 @@ async def maintenance_loop(application) -> None:
 # APP LIFECYCLE
 # ============================================================
 async def post_init(application) -> None:
-    global maintenance_task, telegram_sender_task, leaderboard_dispatcher_task
+    global maintenance_task, telegram_sender_task, leaderboard_dispatcher_task, delayed_start_task
 
     await init_db()
 
     telegram_sender_task = asyncio.create_task(telegram_sender_loop(application))
     leaderboard_dispatcher_task = asyncio.create_task(leaderboard_dispatcher_loop(application))
 
-    async def delayed_start():
+    async def delayed_start() -> None:
         await asyncio.sleep(5)
         await fetch_all_usdt_symbols(force=True)
         await fetch_top_active_usdt_symbols(force=True)
         await restart_streams(application)
         logger.info("Scanner started after delay.")
 
-    asyncio.create_task(delayed_start())
-
+    delayed_start_task = asyncio.create_task(delayed_start())
     maintenance_task = asyncio.create_task(maintenance_loop(application))
     logger.info("Bot initialized.")
 
-async def shutdown() -> None:
-    global shared_http_session, maintenance_task, telegram_sender_task, leaderboard_dispatcher_task
+async def cleanup_background_tasks() -> None:
+    global shared_http_session, maintenance_task, telegram_sender_task, leaderboard_dispatcher_task, delayed_start_task
 
     for task in ws_tasks:
         task.cancel()
     if ws_tasks:
         await asyncio.gather(*ws_tasks, return_exceptions=True)
+    ws_tasks.clear()
 
-    if maintenance_task:
-        maintenance_task.cancel()
-        await asyncio.gather(maintenance_task, return_exceptions=True)
+    for task in [maintenance_task, telegram_sender_task, leaderboard_dispatcher_task, delayed_start_task]:
+        if task:
+            task.cancel()
 
-    if telegram_sender_task:
-        telegram_sender_task.cancel()
-        await asyncio.gather(telegram_sender_task, return_exceptions=True)
+    await asyncio.gather(
+        *[t for t in [maintenance_task, telegram_sender_task, leaderboard_dispatcher_task, delayed_start_task] if t],
+        return_exceptions=True,
+    )
 
-    if leaderboard_dispatcher_task:
-        leaderboard_dispatcher_task.cancel()
-        await asyncio.gather(leaderboard_dispatcher_task, return_exceptions=True)
+    maintenance_task = None
+    telegram_sender_task = None
+    leaderboard_dispatcher_task = None
+    delayed_start_task = None
 
     if shared_http_session and not shared_http_session.closed:
         await shared_http_session.close()
+        shared_http_session = None
+
+async def post_shutdown(application) -> None:
+    await cleanup_background_tasks()
+    logger.info("Bot shutdown complete.")
 
 def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("Please set TELEGRAM_BOT_TOKEN in your environment first.")
 
+    logger.info("Starting bot with DB file: %s", ensure_db_path())
+
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
@@ -1032,13 +1075,7 @@ def main() -> None:
     application.add_handler(CommandHandler("reload", reload_cmd))
     application.add_error_handler(error_handler)
 
-    try:
-        application.run_polling()
-    finally:
-        try:
-            asyncio.run(shutdown())
-        except RuntimeError:
-            pass
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
