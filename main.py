@@ -3,8 +3,8 @@ import time
 from pybit.unified_trading import HTTP, WebSocket
 
 # ===== CONFIG =====
-SYMBOLS = os.getenv("SYMBOLS", "BTCUSDT").split(",")
-TIMEFRAMES = os.getenv("TIMEFRAMES", "1,5,60").split(",")
+SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT").split(",") if s.strip()]
+TIMEFRAMES = [tf.strip() for tf in os.getenv("TIMEFRAMES", "1,5,60").split(",") if tf.strip()]
 
 RSI_ENABLED = os.getenv("RSI_ENABLED", "true").lower() == "true"
 EMA_ENABLED = os.getenv("EMA_ENABLED", "true").lower() == "true"
@@ -20,7 +20,6 @@ def init_state():
             data[symbol][tf] = []
 
 
-# ===== INDICATORS =====
 def ema(values, length=200):
     if len(values) < length:
         return None
@@ -41,80 +40,94 @@ def rsi(values, length=14):
     gains = []
     losses = []
 
-    for i in range(1, length + 1):
+    for i in range(1, len(values)):
         diff = values[i] - values[i - 1]
         gains.append(max(diff, 0))
         losses.append(abs(min(diff, 0)))
 
-    avg_gain = sum(gains) / length
-    avg_loss = sum(losses) / length
+    avg_gain = sum(gains[:length]) / length
+    avg_loss = sum(losses[:length]) / length
+
+    for i in range(length, len(gains)):
+        avg_gain = ((avg_gain * (length - 1)) + gains[i]) / length
+        avg_loss = ((avg_loss * (length - 1)) + losses[i]) / length
 
     if avg_loss == 0:
-        return 100
+        return 100.0
 
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 
-# ===== HANDLER =====
 def handle(msg):
     try:
-        print("RAW MESSAGE:", msg)
+        if not isinstance(msg, dict):
+            return
 
-        data_list = msg.get("data", [])
+        if "data" not in msg:
+            return
+
+        data_list = msg["data"]
+
+        if not isinstance(data_list, list):
+            return
 
         for item in data_list:
-            symbol = item.get("symbol")
-            interval = item.get("interval")
-            close = item.get("close")
-            confirm = item.get("confirm")
-
-            # Skip if any key missing
-            if symbol is None or interval is None or close is None:
+            if not isinstance(item, dict):
                 continue
 
-            tf = str(interval)
-            close = float(close)
+            required_keys = ["symbol", "interval", "close", "confirm"]
+            if not all(key in item for key in required_keys):
+                continue
 
-            # Skip unknown symbol/timeframe
-            if symbol not in data or tf not in data[symbol]:
+            symbol = str(item["symbol"]).upper()
+            tf = str(item["interval"])
+            confirm = bool(item["confirm"])
+
+            try:
+                close = float(item["close"])
+            except (TypeError, ValueError):
+                continue
+
+            if symbol not in data:
+                continue
+
+            if tf not in data[symbol]:
+                continue
+
+            if not confirm:
                 continue
 
             arr = data[symbol][tf]
+            arr.append(close)
 
-            if confirm:
-                arr.append(close)
+            if len(arr) > 300:
+                arr.pop(0)
 
-                if len(arr) > 300:
-                    arr.pop(0)
+            if RSI_ENABLED:
+                r = rsi(arr)
+                if r is not None:
+                    print(f"{symbol} {tf} RSI: {r:.2f}")
 
-                # ===== RSI =====
-                if RSI_ENABLED:
-                    r = rsi(arr)
-                    if r is not None:
-                        print(f"{symbol} {tf} RSI: {r:.2f}")
-
-                # ===== EMA DISTANCE =====
-                if EMA_ENABLED:
-                    e = ema(arr, 200)
-                    if e is not None:
-                        dist = (close - e) / e * 100
-                        print(f"{symbol} {tf} EMA200 DIST: {dist:.2f}%")
+            if EMA_ENABLED:
+                e = ema(arr, 200)
+                if e is not None:
+                    dist = ((close - e) / e) * 100
+                    print(f"{symbol} {tf} EMA200 DIST: {dist:.2f}%")
 
     except Exception as e:
         print("error:", e)
 
 
-# ===== MAIN =====
 def main():
     init_state()
 
     print("Starting bot...")
 
-    # HTTP (for later use)
+    # Kept for later when you add historical candle loading
     session = HTTP(testnet=False)
+    _ = session
 
-    # WebSocket
     ws = WebSocket(testnet=False, channel_type="linear")
 
     for symbol in SYMBOLS:
@@ -124,6 +137,7 @@ def main():
                 symbol=symbol,
                 callback=handle
             )
+            print(f"Subscribed: {symbol} {tf}")
 
     print("Bot is running...")
 
