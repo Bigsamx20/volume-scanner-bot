@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 from pybit.unified_trading import HTTP, WebSocket
 
 # ===== CONFIG =====
@@ -10,6 +11,7 @@ RSI_ENABLED = os.getenv("RSI_ENABLED", "true").lower() == "true"
 EMA_ENABLED = os.getenv("EMA_ENABLED", "true").lower() == "true"
 
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "300"))
+HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "60"))
 
 # ===== STATE =====
 data = {}
@@ -62,6 +64,12 @@ def rsi(values, length=14):
     return 100 - (100 / (1 + rs))
 
 
+def heartbeat():
+    while True:
+        print("BOT ALIVE ✅")
+        time.sleep(HEARTBEAT_SECONDS))
+
+
 def fetch_history(symbol, tf):
     try:
         response = session.get_kline(
@@ -88,18 +96,17 @@ def fetch_history(symbol, tf):
         data[symbol][tf] = closes
         print(f"Loaded history: {symbol} {tf} ({len(closes)} candles)")
 
-        process_indicators(symbol, tf, closes[-1] if closes else None)
+        if closes:
+            process_indicators(symbol, tf, closes[-1], source="history")
 
     except Exception as e:
         print(f"History fetch error {symbol} {tf}: {e}")
 
 
-def process_indicators(symbol, tf, arr_last_close):
+def process_indicators(symbol, tf, close, source="live"):
     arr = data[symbol][tf]
-    close = arr_last_close
 
-    if close is None:
-        return
+    print(f"TEST SIGNAL: {symbol} {tf} close={close} source={source}")
 
     if RSI_ENABLED:
         r = rsi(arr)
@@ -155,7 +162,7 @@ def handle(msg):
             if len(arr) > HISTORY_LIMIT:
                 arr.pop(0)
 
-            process_indicators(symbol, tf, close)
+            process_indicators(symbol, tf, close, source="live")
 
     except Exception as e:
         print("error:", e)
@@ -167,6 +174,10 @@ def main():
     init_state()
 
     print("Starting bot...")
+    print("TEST ALERT: bot started successfully")
+
+    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+    heartbeat_thread.start()
 
     session = HTTP(testnet=False)
 
