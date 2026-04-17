@@ -2,12 +2,14 @@ import os
 import time
 from pybit.unified_trading import HTTP, WebSocket
 
+# ===== CONFIG =====
 SYMBOLS = os.getenv("SYMBOLS", "BTCUSDT").split(",")
 TIMEFRAMES = os.getenv("TIMEFRAMES", "1,5,60").split(",")
 
 RSI_ENABLED = os.getenv("RSI_ENABLED", "true").lower() == "true"
 EMA_ENABLED = os.getenv("EMA_ENABLED", "true").lower() == "true"
 
+# ===== STATE =====
 data = {}
 
 
@@ -18,6 +20,7 @@ def init_state():
             data[symbol][tf] = []
 
 
+# ===== INDICATORS =====
 def ema(values, length=200):
     if len(values) < length:
         return None
@@ -53,13 +56,29 @@ def rsi(values, length=14):
     return 100 - (100 / (1 + rs))
 
 
+# ===== HANDLER =====
 def handle(msg):
     try:
-        for item in msg.get("data", []):
-            symbol = item["symbol"]
-            tf = str(item["interval"])
-            close = float(item["close"])
-            confirm = item["confirm"]
+        print("RAW MESSAGE:", msg)
+
+        data_list = msg.get("data", [])
+
+        for item in data_list:
+            symbol = item.get("symbol")
+            interval = item.get("interval")
+            close = item.get("close")
+            confirm = item.get("confirm")
+
+            # Skip if any key missing
+            if symbol is None or interval is None or close is None:
+                continue
+
+            tf = str(interval)
+            close = float(close)
+
+            # Skip unknown symbol/timeframe
+            if symbol not in data or tf not in data[symbol]:
+                continue
 
             arr = data[symbol][tf]
 
@@ -69,11 +88,13 @@ def handle(msg):
                 if len(arr) > 300:
                     arr.pop(0)
 
+                # ===== RSI =====
                 if RSI_ENABLED:
                     r = rsi(arr)
                     if r is not None:
                         print(f"{symbol} {tf} RSI: {r:.2f}")
 
+                # ===== EMA DISTANCE =====
                 if EMA_ENABLED:
                     e = ema(arr, 200)
                     if e is not None:
@@ -84,10 +105,16 @@ def handle(msg):
         print("error:", e)
 
 
+# ===== MAIN =====
 def main():
     init_state()
 
+    print("Starting bot...")
+
+    # HTTP (for later use)
     session = HTTP(testnet=False)
+
+    # WebSocket
     ws = WebSocket(testnet=False, channel_type="linear")
 
     for symbol in SYMBOLS:
