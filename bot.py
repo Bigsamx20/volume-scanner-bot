@@ -683,7 +683,9 @@ async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         ))
         await db.commit()
 
-      scope_text = "ALL_USDT" if symbols_mode == "ALL_USDT" else symbol_input.upper()
+        await restart_streams(context.application)
+
+    scope_text = "ALL_USDT" if symbols_mode == "ALL_USDT" else symbol_input.upper()
     await reply_text_safe(
         update,
         "Rule added.\n\n"
@@ -693,6 +695,7 @@ async def add_rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Baseline candles: {baseline_candles}\n"
         f"Symbols: {scope_text}\n"
         f"Mode: once per candle"
+    )
     )
 
     await restart_streams(context.application)
