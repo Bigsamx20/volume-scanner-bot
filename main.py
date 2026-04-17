@@ -41,8 +41,8 @@ TIMEFRAME_DEFAULTS = {
         "ema_distance": {
             "enabled": True,
             "ema_length": 200,
-            "above_percent": 20.0,
-            "below_percent": -20.0,
+            "above_percent": 2.0,
+            "below_percent": -2.0,
         },
     },
 }
