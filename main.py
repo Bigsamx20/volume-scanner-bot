@@ -24,7 +24,7 @@ TIMEFRAMES = ["1", "5", "60"]
 
 # =========================
 # DEFAULT SETTINGS FOR ALL SYMBOLS
-# RSI default: overbought=85, oversold=20
+# RSI default: overbought=80, oversold=25
 # EMA stays enabled
 # =========================
 TIMEFRAME_DEFAULTS = {
@@ -32,8 +32,8 @@ TIMEFRAME_DEFAULTS = {
         "rsi": {
             "enabled": True,
             "length": 14,
-            "overbought": 85,
-            "oversold": 20,
+            "overbought": 80,
+            "oversold": 25,
         },
         "ema_distance": {
             "enabled": True,
@@ -46,8 +46,8 @@ TIMEFRAME_DEFAULTS = {
         "rsi": {
             "enabled": True,
             "length": 14,
-            "overbought": 85,
-            "oversold": 20,
+            "overbought": 80,
+            "oversold": 25,
         },
         "ema_distance": {
             "enabled": True,
@@ -60,8 +60,8 @@ TIMEFRAME_DEFAULTS = {
         "rsi": {
             "enabled": True,
             "length": 14,
-            "overbought": 85,
-            "oversold": 20,
+            "overbought": 80,
+            "oversold": 25,
         },
         "ema_distance": {
             "enabled": True,
