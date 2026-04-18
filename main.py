@@ -32,28 +32,28 @@ TIMEFRAME_DEFAULTS = {
         "rsi": {
             "enabled": True,
             "length": 14,
-            "overbought": 80,
-            "oversold": 20,
+            "overbought": 83,
+            "oversold": 17,
         },
         "ema_distance": {
             "enabled": True,
             "ema_length": 50,
-            "above_percent": 1.0,
-            "below_percent": -1.0,
+            "above_percent": 2.0,
+            "below_percent": -2.0,
         },
     },
     "60": {
         "rsi": {
             "enabled": True,
             "length": 14,
-            "overbought": 80,
-            "oversold": 20,
+            "overbought": 83,
+            "oversold": 17,
         },
         "ema_distance": {
             "enabled": True,
             "ema_length": 100,
-            "above_percent": 1.5,
-            "below_percent": -1.5,
+            "above_percent": 2.0,
+            "below_percent": -2.0,
         },
     },
 }
