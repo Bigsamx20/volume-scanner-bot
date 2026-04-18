@@ -3,10 +3,8 @@ import time
 import math
 import threading
 import requests
-import hmac
-import hashlib
-from urllib.parse import urlencode
 from copy import deepcopy
+from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from pybit.unified_trading import HTTP, WebSocket
 
 # =========================
@@ -16,7 +14,7 @@ TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-CATEGORY = os.getenv("BYBIT_CATEGORY", "linear")
+CATEGORY = os.getenv("BYBIT_CATEGORY", "linear").strip().lower()
 TOP_N = int(os.getenv("TOP_N", "500"))
 LIVE_WS_SYMBOLS = int(os.getenv("LIVE_WS_SYMBOLS", "80"))
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "300"))
@@ -29,16 +27,17 @@ WS_DEBUG = os.getenv("WS_DEBUG", "true").lower() == "true"
 TIMEFRAMES = ["5", "60"]
 
 # =========================
-# BINANCE TESTNET CONFIG
+# BYBIT MAINNET CONFIG
 # =========================
-BINANCE_ENABLED = os.getenv("BINANCE_ENABLED", "false").lower() == "true"
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
-BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "").strip()
-BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://testnet.binance.vision").rstrip("/")
-BINANCE_SYMBOL = os.getenv("BINANCE_SYMBOL", "BTCUSDT").strip().upper()
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
+BYBIT_TRADING_ENABLED = os.getenv("BYBIT_TRADING_ENABLED", "false").lower() == "true"
+BYBIT_SYMBOL = os.getenv("BYBIT_SYMBOL", "BTCUSDT").strip().upper()
 
-BINANCE_TRADING_ENABLED = os.getenv("BINANCE_TRADING_ENABLED", "false").lower() == "true"
-BINANCE_BUY_QUOTE_QTY = os.getenv("BINANCE_BUY_QUOTE_QTY", "20").strip()
+# Trade size is treated as margin in USDT.
+# Effective position notional ~= TRADE_SIZE_USDT * LEVERAGE.
+BYBIT_TRADE_SIZE_USDT = float(os.getenv("BYBIT_TRADE_SIZE_USDT", "20"))
+BYBIT_LEVERAGE = int(os.getenv("BYBIT_LEVERAGE", "1"))
 
 # =========================
 # AUTO STRATEGY DEFAULTS
@@ -79,10 +78,23 @@ TIMEFRAME_DEFAULTS = {
 SYMBOL_OVERRIDES = {}
 
 # =========================
+# HELPERS: SESSION
+# =========================
+def create_session():
+    if BYBIT_API_KEY and BYBIT_API_SECRET:
+        return HTTP(
+            testnet=False,
+            api_key=BYBIT_API_KEY,
+            api_secret=BYBIT_API_SECRET,
+        )
+    return HTTP(testnet=False)
+
+
+session = create_session()
+
+# =========================
 # GLOBALS
 # =========================
-session = HTTP(testnet=False)
-
 data = {}
 last_alert_candle = {}
 shortlist = set()
@@ -91,7 +103,7 @@ live_symbols = set()
 shortlist_lock = threading.Lock()
 ws_lock = threading.Lock()
 positions_lock = threading.Lock()
-binance_symbols_lock = threading.Lock()
+bybit_symbols_lock = threading.Lock()
 
 ws_connections = {}
 current_candle_start = {}
@@ -102,8 +114,7 @@ last_command_time = 0
 last_ws_message_at = 0
 last_shortlist_refresh_at = 0
 
-binance_time_offset_ms = 0
-binance_spot_symbols = set()
+bybit_linear_symbols = set()
 
 # =========================
 # LIVE AUTO SETTINGS
@@ -117,6 +128,9 @@ RSI_BUY_THRESHOLD = DEFAULT_RSI_BUY
 RSI_SELL_THRESHOLD = DEFAULT_RSI_SELL
 MAX_OPEN_POSITIONS = DEFAULT_MAX_OPEN_POSITIONS
 SYMBOL_COOLDOWN_SECONDS = DEFAULT_SYMBOL_COOLDOWN_SECONDS
+
+TRADE_SIZE_USDT = BYBIT_TRADE_SIZE_USDT
+LEVERAGE = BYBIT_LEVERAGE
 
 # positions per symbol
 positions = {}
@@ -252,6 +266,41 @@ def should_alert_once_per_candle(alert_type: str, symbol: str, tf: str, candle_s
 def pct_text(value: float) -> str:
     return "OFF" if value == 0 else f"{value:.2f}%"
 
+
+def decimal_places_from_step(step_str: str) -> int:
+    s = str(step_str)
+    if "." not in s:
+        return 0
+    trimmed = s.rstrip("0")
+    if "." not in trimmed:
+        return 0
+    return len(trimmed.split(".")[1])
+
+
+def floor_to_step_str(value: float, step_str: str) -> str:
+    try:
+        value_dec = Decimal(str(value))
+        step_dec = Decimal(str(step_str))
+        if step_dec <= 0:
+            return str(value_dec)
+
+        floored = (value_dec / step_dec).to_integral_value(rounding=ROUND_DOWN) * step_dec
+        decimals = decimal_places_from_step(step_str)
+        if decimals <= 0:
+            return str(floored.quantize(Decimal("1")))
+        fmt = "1." + ("0" * decimals)
+        return format(floored.quantize(Decimal(fmt)), "f")
+    except (InvalidOperation, ValueError):
+        return str(value)
+
+
+def fmt_qty_or_price(value) -> str:
+    s = str(value)
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
+
+
 # =========================
 # INDICATORS
 # =========================
@@ -281,246 +330,363 @@ def rsi(values, length=14):
     return 100 - (100 / (1 + rs))
 
 # =========================
-# BINANCE TESTNET HELPERS
+# BYBIT HELPERS
 # =========================
-def binance_headers():
-    return {
-        "X-MBX-APIKEY": BINANCE_API_KEY
-    }
+def bybit_keys_ready() -> bool:
+    return bool(BYBIT_API_KEY and BYBIT_API_SECRET)
 
 
-def sign_binance_query_string(query_string: str) -> str:
-    return hmac.new(
-        BINANCE_SECRET_KEY.encode("utf-8"),
-        query_string.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
+def get_bybit_account_wallet():
+    return session.get_wallet_balance(accountType="UNIFIED")
 
 
-def binance_public_get(path: str, params=None):
-    if params is None:
-        params = {}
-
-    url = f"{BINANCE_BASE_URL}{path}"
-    response = requests.get(url, params=params, timeout=15)
-
-    try:
-        payload = response.json()
-    except Exception:
-        payload = {"raw_text": response.text}
-
-    if not response.ok:
-        raise Exception(f"Binance public GET failed {response.status_code}: {payload}")
-
-    return payload
-
-
-def sync_binance_time():
-    global binance_time_offset_ms
-
-    server_time_data = binance_public_get("/api/v3/time")
-    server_time = int(server_time_data["serverTime"])
-    local_time = int(time.time() * 1000)
-    binance_time_offset_ms = server_time - local_time
-
-    print("Binance time sync:")
-    print(" server_time =", server_time)
-    print(" local_time  =", local_time)
-    print(" offset_ms   =", binance_time_offset_ms)
-
-
-def get_binance_timestamp():
-    return int(time.time() * 1000) + binance_time_offset_ms
-
-
-def binance_signed_get(path: str, params=None):
-    if params is None:
-        params = {}
-
-    params = dict(params)
-    params["timestamp"] = get_binance_timestamp()
-    params["recvWindow"] = 10000
-
-    query_string = urlencode(params, doseq=True)
-    signature = sign_binance_query_string(query_string)
-    full_query = f"{query_string}&signature={signature}"
-
-    url = f"{BINANCE_BASE_URL}{path}?{full_query}"
-
-    response = requests.get(
-        url,
-        headers=binance_headers(),
-        timeout=15
-    )
-
-    try:
-        payload = response.json()
-    except Exception:
-        payload = {"raw_text": response.text}
-
-    if not response.ok:
-        raise Exception(f"Binance signed GET failed {response.status_code}: {payload}")
-
-    return payload
-
-
-def binance_signed_post(path: str, params=None):
-    if params is None:
-        params = {}
-
-    params = dict(params)
-    params["timestamp"] = get_binance_timestamp()
-    params["recvWindow"] = 10000
-
-    query_string = urlencode(params, doseq=True)
-    signature = sign_binance_query_string(query_string)
-    full_query = f"{query_string}&signature={signature}"
-
-    url = f"{BINANCE_BASE_URL}{path}?{full_query}"
-
-    response = requests.post(
-        url,
-        headers=binance_headers(),
-        timeout=15
-    )
-
-    try:
-        payload = response.json()
-    except Exception:
-        payload = {"raw_text": response.text}
-
-    if not response.ok:
-        raise Exception(f"Binance signed POST failed {response.status_code}: {payload}")
-
-    return payload
-
-
-def get_binance_account():
-    sync_binance_time()
-    return binance_signed_get("/api/v3/account")
-
-
-def get_binance_nonzero_balances_text():
-    account = get_binance_account()
-    balances = account.get("balances", [])
+def get_bybit_nonzero_balances_text():
+    account = get_bybit_account_wallet()
+    root_list = account.get("result", {}).get("list", [])
+    if not root_list:
+        return "No Bybit wallet data returned."
 
     rows = []
-    for b in balances:
-        free_amt = safe_float(b.get("free"), 0.0)
-        locked_amt = safe_float(b.get("locked"), 0.0)
-        if free_amt > 0 or locked_amt > 0:
-            rows.append(f"{b.get('asset')}: free={free_amt}, locked={locked_amt}")
+    for acct in root_list:
+        for coin in acct.get("coin", []):
+            equity = safe_float(coin.get("equity"), 0.0)
+            wallet_balance = safe_float(coin.get("walletBalance"), 0.0)
+            if equity > 0 or wallet_balance > 0:
+                rows.append(
+                    f"{coin.get('coin')}: equity={equity}, wallet={wallet_balance}, usd={coin.get('usdValue')}"
+                )
 
     if not rows:
-        return "No non-zero Binance testnet balances found."
+        return "No non-zero Bybit balances found."
 
-    return "💰 Binance balances\n" + "\n".join(rows[:20])
-
-
-def refresh_binance_spot_symbols():
-    global binance_spot_symbols
-
-    try:
-        info = binance_public_get("/api/v3/exchangeInfo")
-        symbols = info.get("symbols", [])
-        valid = set()
-
-        for s in symbols:
-            if s.get("status") != "TRADING":
-                continue
-            if not s.get("isSpotTradingAllowed", False):
-                continue
-            symbol_name = str(s.get("symbol", "")).upper()
-            if symbol_name.endswith("USDT"):
-                valid.add(symbol_name)
-
-        with binance_symbols_lock:
-            binance_spot_symbols = valid
-
-        print(f"Loaded Binance tradable spot symbols: {len(valid)}")
-    except Exception as e:
-        print("Failed to refresh Binance spot symbols:", e)
+    return "💰 Bybit balances\n" + "\n".join(rows[:20])
 
 
-def is_symbol_supported_on_binance(symbol: str) -> bool:
-    with binance_symbols_lock:
-        return symbol in binance_spot_symbols
+def get_bybit_total_available_balance_usd():
+    account = get_bybit_account_wallet()
+    root_list = account.get("result", {}).get("list", [])
+    if not root_list:
+        return 0.0
+
+    total_available = safe_float(root_list[0].get("totalAvailableBalance"), 0.0)
+    return total_available if total_available is not None else 0.0
 
 
-def get_binance_symbol_info(symbol: str):
-    info = binance_public_get("/api/v3/exchangeInfo", {"symbol": symbol})
-    symbols = info.get("symbols", [])
+def get_bybit_instrument_info(symbol: str):
+    info = session.get_instruments_info(category=CATEGORY, symbol=symbol)
+    symbols = info.get("result", {}).get("list", [])
     if not symbols:
-        raise Exception(f"No exchange info found for {symbol}")
+        raise Exception(f"No instrument info found for {symbol}")
     return symbols[0]
 
 
-def get_filter_value(filters, filter_type, key):
-    for f in filters:
-        if f.get("filterType") == filter_type:
-            return f.get(key)
-    return None
+def get_bybit_last_price(symbol: str) -> float:
+    ticker = session.get_tickers(category=CATEGORY, symbol=symbol)
+    rows = ticker.get("result", {}).get("list", [])
+    if not rows:
+        raise Exception(f"No ticker returned for {symbol}")
 
-
-def floor_to_step(value: float, step: float) -> float:
-    if step <= 0:
-        return value
-    return math.floor(value / step) * step
-
-
-def format_quantity(qty: float, step_size_str: str) -> str:
-    if "." in step_size_str:
-        trimmed = step_size_str.rstrip("0")
-        decimals = len(trimmed.split(".")[1]) if "." in trimmed else 0
-    else:
-        decimals = 0
-    formatted = f"{qty:.{decimals}f}"
-    return formatted.rstrip("0").rstrip(".") if "." in formatted else formatted
-
-
-def get_sellable_base_asset_balance(symbol: str) -> float:
-    if not symbol.endswith("USDT"):
-        return 0.0
-
-    base_asset = symbol[:-4]
-    account = binance_signed_get("/api/v3/account")
-    balances = account.get("balances", [])
-
-    for b in balances:
-        if b.get("asset") == base_asset:
-            return safe_float(b.get("free"), 0.0)
-
-    return 0.0
-
-
-def get_binance_last_price(symbol: str) -> float:
-    ticker = binance_public_get("/api/v3/ticker/price", {"symbol": symbol})
-    price = safe_float(ticker.get("price"))
+    price = safe_float(rows[0].get("lastPrice"))
     if price is None or price <= 0:
         raise Exception(f"Could not read valid last price for {symbol}")
     return price
 
 
-def compute_average_fill_price(order: dict):
-    executed_qty = safe_float(order.get("executedQty"), 0.0)
-    cummulative_quote_qty = safe_float(order.get("cummulativeQuoteQty"), 0.0)
+def refresh_bybit_linear_symbols():
+    global bybit_linear_symbols
 
-    if executed_qty and executed_qty > 0 and cummulative_quote_qty and cummulative_quote_qty > 0:
-        return cummulative_quote_qty / executed_qty
+    try:
+        valid = set()
+        cursor = None
 
-    fills = order.get("fills", [])
-    if fills:
-        total_qty = 0.0
-        total_quote = 0.0
-        for f in fills:
-            p = safe_float(f.get("price"), 0.0)
-            q = safe_float(f.get("qty"), 0.0)
-            total_qty += q
-            total_quote += p * q
-        if total_qty > 0:
-            return total_quote / total_qty
+        while True:
+            params = {
+                "category": CATEGORY,
+                "limit": 1000,
+            }
+            if cursor:
+                params["cursor"] = cursor
+
+            response = session.get_instruments_info(**params)
+            result = response.get("result", {})
+            rows = result.get("list", [])
+
+            for row in rows:
+                symbol_name = str(row.get("symbol", "")).upper()
+                status = str(row.get("status", ""))
+                if status != "Trading":
+                    continue
+                if symbol_name.endswith("USDT"):
+                    valid.add(symbol_name)
+
+            cursor = result.get("nextPageCursor")
+            if not cursor:
+                break
+
+        with bybit_symbols_lock:
+            bybit_linear_symbols = valid
+
+        print(f"Loaded Bybit tradable {CATEGORY} symbols: {len(valid)}")
+    except Exception as e:
+        print("Failed to refresh Bybit symbols:", e)
+
+
+def is_symbol_supported_on_bybit(symbol: str) -> bool:
+    with bybit_symbols_lock:
+        if not bybit_linear_symbols:
+            return True
+        return symbol in bybit_linear_symbols
+
+
+def get_bybit_position(symbol: str):
+    response = session.get_positions(category=CATEGORY, symbol=symbol)
+    rows = response.get("result", {}).get("list", [])
+
+    if not rows:
+        return None
+
+    for row in rows:
+        size = safe_float(row.get("size"), 0.0)
+        side = str(row.get("side", "")).strip()
+        if size and size > 0 and side in ("Buy", "Sell"):
+            return row
 
     return None
+
+
+def get_bybit_position_size(symbol: str) -> float:
+    pos = get_bybit_position(symbol)
+    if not pos:
+        return 0.0
+    return safe_float(pos.get("size"), 0.0)
+
+
+def get_bybit_position_entry_price(symbol: str):
+    pos = get_bybit_position(symbol)
+    if not pos:
+        return None
+    return safe_float(pos.get("avgPrice") or pos.get("avgEntryPrice"))
+
+
+def sync_local_position_from_exchange(symbol: str):
+    pos = get_bybit_position(symbol)
+    if not pos:
+        return False
+
+    entry_price = safe_float(pos.get("avgPrice") or pos.get("avgEntryPrice"))
+    quantity = safe_float(pos.get("size"), 0.0)
+    side = str(pos.get("side", "")).strip()
+
+    if side != "Buy" or not entry_price or quantity <= 0:
+        return False
+
+    set_position(symbol, entry_price, quantity, "bybit_sync")
+    return True
+
+
+def compute_bybit_order_qty(symbol: str, last_price: float):
+    if last_price <= 0:
+        raise Exception(f"Invalid last price for {symbol}")
+
+    instrument = get_bybit_instrument_info(symbol)
+    lot = instrument.get("lotSizeFilter", {})
+
+    qty_step = str(lot.get("qtyStep", "0.001"))
+    min_order_qty = safe_float(lot.get("minOrderQty"), 0.0)
+    min_notional_value = safe_float(lot.get("minNotionalValue"), 0.0)
+    max_mkt_order_qty = safe_float(lot.get("maxMktOrderQty"), 0.0)
+
+    # Effective position notional
+    notional_usdt = TRADE_SIZE_USDT * LEVERAGE
+    raw_qty = notional_usdt / last_price
+    qty_str = fmt_qty_or_price(floor_to_step_str(raw_qty, qty_step))
+    qty = safe_float(qty_str, 0.0)
+
+    if qty <= 0:
+        raise Exception(
+            f"Rounded quantity became 0 for {symbol}. Increase BYBIT_TRADE_SIZE_USDT or reduce precision issue."
+        )
+
+    if min_order_qty and qty < min_order_qty:
+        raise Exception(
+            f"Qty too small for {symbol}. qty={qty}, minOrderQty={min_order_qty}. "
+            f"Increase BYBIT_TRADE_SIZE_USDT or leverage."
+        )
+
+    notional_check = qty * last_price
+    if min_notional_value and notional_check < min_notional_value:
+        raise Exception(
+            f"Notional too small for {symbol}. notional={notional_check:.8f}, "
+            f"minNotionalValue={min_notional_value}. Increase BYBIT_TRADE_SIZE_USDT or leverage."
+        )
+
+    if max_mkt_order_qty and qty > max_mkt_order_qty:
+        raise Exception(
+            f"Qty too large for {symbol}. qty={qty}, maxMktOrderQty={max_mkt_order_qty}. "
+            f"Reduce BYBIT_TRADE_SIZE_USDT or leverage."
+        )
+
+    return qty_str, qty, instrument
+
+
+def clamp_leverage_for_symbol(symbol: str, requested_leverage: int) -> int:
+    instrument = get_bybit_instrument_info(symbol)
+    lev_filter = instrument.get("leverageFilter", {})
+    min_lev = safe_int(lev_filter.get("minLeverage"), 1)
+    max_lev = safe_int(lev_filter.get("maxLeverage"), requested_leverage)
+
+    leverage = requested_leverage
+    if leverage < min_lev:
+        leverage = min_lev
+    if leverage > max_lev:
+        leverage = max_lev
+    return leverage
+
+
+def ensure_bybit_leverage(symbol: str):
+    target = clamp_leverage_for_symbol(symbol, LEVERAGE)
+
+    try:
+        response = session.set_leverage(
+            category=CATEGORY,
+            symbol=symbol,
+            buyLeverage=str(target),
+            sellLeverage=str(target),
+        )
+        print(f"Set leverage {symbol} -> {target}x:", response)
+        return target
+    except Exception as e:
+        msg = str(e).lower()
+
+        # Harmless cases: already set or current mode/state prevents a no-op change.
+        harmless_tokens = [
+            "110043",   # leverage not modified
+            "not modified",
+            "same to the existing leverage",
+        ]
+        if any(token in msg for token in harmless_tokens):
+            print(f"Leverage already set for {symbol}: {e}")
+            return target
+
+        raise
+
+
+def place_bybit_market_buy(symbol: str):
+    if CATEGORY != "linear":
+        raise Exception("This version is built for BYBIT_CATEGORY=linear")
+
+    if not BYBIT_TRADING_ENABLED:
+        raise Exception("BYBIT_TRADING_ENABLED is false")
+
+    if not bybit_keys_ready():
+        raise Exception("Bybit API keys missing")
+
+    if symbol_in_position(symbol):
+        raise Exception(f"Already in tracked position for {symbol}")
+
+    exchange_pos = get_bybit_position(symbol)
+    if exchange_pos and str(exchange_pos.get("side", "")) == "Buy":
+        raise Exception(f"Exchange already shows an open Buy position for {symbol}")
+
+    if get_open_positions_count() >= MAX_OPEN_POSITIONS:
+        raise Exception("Max open positions reached")
+
+    available_balance = get_bybit_total_available_balance_usd()
+    if available_balance <= 0:
+        raise Exception("No available balance on Bybit account")
+
+    target_leverage = ensure_bybit_leverage(symbol)
+    last_price = get_bybit_last_price(symbol)
+    qty_str, qty, _ = compute_bybit_order_qty(symbol, last_price)
+
+    order = session.place_order(
+        category=CATEGORY,
+        symbol=symbol,
+        side="Buy",
+        orderType="Market",
+        qty=qty_str,
+    )
+
+    time.sleep(1.0)
+
+    if not sync_local_position_from_exchange(symbol):
+        fallback_entry = get_bybit_last_price(symbol)
+        set_position(symbol, fallback_entry, qty, "buy_fallback_market")
+
+    return order, target_leverage
+
+
+def place_bybit_market_sell(symbol: str):
+    if CATEGORY != "linear":
+        raise Exception("This version is built for BYBIT_CATEGORY=linear")
+
+    if not BYBIT_TRADING_ENABLED:
+        raise Exception("BYBIT_TRADING_ENABLED is false")
+
+    if not bybit_keys_ready():
+        raise Exception("Bybit API keys missing")
+
+    pos = get_bybit_position(symbol)
+    if not pos:
+        raise Exception(f"No open exchange position found for {symbol}")
+
+    side = str(pos.get("side", "")).strip()
+    size = safe_float(pos.get("size"), 0.0)
+
+    if side != "Buy" or size <= 0:
+        raise Exception(f"No open long position to close for {symbol}")
+
+    instrument = get_bybit_instrument_info(symbol)
+    qty_step = str(instrument.get("lotSizeFilter", {}).get("qtyStep", "0.001"))
+    qty_str = fmt_qty_or_price(floor_to_step_str(size, qty_step))
+    qty_val = safe_float(qty_str, 0.0)
+
+    if qty_val <= 0:
+        raise Exception(f"Rounded close quantity became 0 for {symbol}")
+
+    order = session.place_order(
+        category=CATEGORY,
+        symbol=symbol,
+        side="Sell",
+        orderType="Market",
+        qty=qty_str,
+        reduceOnly=True,
+    )
+
+    time.sleep(1.0)
+    remove_position(symbol)
+    return order
+
+
+def test_bybit_connection():
+    if CATEGORY != "linear":
+        print(f"Warning: current CATEGORY={CATEGORY}, but this bot is intended for linear.")
+
+    if not bybit_keys_ready():
+        print("Bybit keys missing")
+        send_telegram("❌ Bybit mainnet keys missing")
+        return
+
+    try:
+        print("Testing Bybit market data...")
+        ticker = session.get_tickers(category=CATEGORY, symbol=BYBIT_SYMBOL)
+        print("Bybit ticker OK:", ticker)
+
+        print("Testing Bybit wallet balance endpoint...")
+        account = get_bybit_account_wallet()
+        print("Bybit wallet OK:", account)
+
+        refresh_bybit_linear_symbols()
+
+        send_telegram(
+            f"✅ Bybit MAINNET connected\n"
+            f"Category: {CATEGORY}\n"
+            f"Symbol: {BYBIT_SYMBOL}\n"
+            f"Trading enabled: {BYBIT_TRADING_ENABLED}"
+        )
+    except Exception as e:
+        print("Bybit mainnet connection failed:", e)
+        send_telegram(f"❌ Bybit MAINNET connection failed\n{e}")
 
 # =========================
 # POSITION / AUTO STATE
@@ -647,6 +813,7 @@ def get_strategy_text():
     return (
         f"🤖 Auto strategy\n"
         f"Auto trading: {AUTO_TRADING_ENABLED}\n"
+        f"Exchange trading: Bybit MAINNET ({CATEGORY})\n"
         f"Buy rule: 5m RSI <= {RSI_BUY_THRESHOLD:.2f}\n"
         f"Sell rule: 5m RSI >= {RSI_SELL_THRESHOLD:.2f} OR SL/TP/Trailing\n"
         f"Stop loss: {pct_text(STOP_LOSS_PCT)}\n"
@@ -655,160 +822,11 @@ def get_strategy_text():
         f"Trailing activation: {pct_text(TRAILING_START_PCT)}\n"
         f"Max open positions: {MAX_OPEN_POSITIONS}\n"
         f"Symbol cooldown: {SYMBOL_COOLDOWN_SECONDS}s\n"
-        f"Buy quote qty per trade: {BINANCE_BUY_QUOTE_QTY}\n"
+        f"Trade size (margin): {TRADE_SIZE_USDT:.4f} USDT\n"
+        f"Leverage: {LEVERAGE}x\n"
+        f"Approx position notional/trade: {(TRADE_SIZE_USDT * LEVERAGE):.4f} USDT\n"
         f"Current open positions: {get_open_positions_count()}"
     )
-
-# =========================
-# BINANCE CONNECTION / ORDERS
-# =========================
-def test_binance_connection():
-    if not BINANCE_ENABLED:
-        print("Binance testnet disabled")
-        return
-
-    if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
-        print("Binance keys missing")
-        send_telegram("❌ Binance Testnet keys missing")
-        return
-
-    try:
-        print("Testing Binance public ping...")
-        ping = binance_public_get("/api/v3/ping")
-        print("Binance ping OK:", ping)
-
-        print("Syncing Binance server time...")
-        sync_binance_time()
-
-        print(f"Testing Binance ticker for {BINANCE_SYMBOL}...")
-        ticker = binance_public_get("/api/v3/ticker/price", {"symbol": BINANCE_SYMBOL})
-        print("Binance ticker OK:", ticker)
-
-        print("Testing Binance signed account endpoint...")
-        account = binance_signed_get("/api/v3/account")
-
-        balances = account.get("balances", [])
-        non_zero = []
-
-        for b in balances:
-            free_amt = safe_float(b.get("free"), 0.0)
-            locked_amt = safe_float(b.get("locked"), 0.0)
-            if free_amt > 0 or locked_amt > 0:
-                non_zero.append(f"{b.get('asset')}: free={free_amt}, locked={locked_amt}")
-
-        print("Binance account OK")
-        if non_zero:
-            print("Non-zero balances:")
-            for row in non_zero[:10]:
-                print(" -", row)
-        else:
-            print("No non-zero balances found on testnet account")
-
-        refresh_binance_spot_symbols()
-
-        send_telegram(
-            f"✅ Binance Testnet connected\n"
-            f"Symbol: {BINANCE_SYMBOL}\n"
-            f"Offset: {binance_time_offset_ms} ms"
-        )
-
-    except Exception as e:
-        print("Binance testnet connection failed:", e)
-        send_telegram(f"❌ Binance Testnet connection failed\n{e}")
-
-
-def place_binance_market_buy(symbol: str):
-    if not BINANCE_ENABLED:
-        raise Exception("BINANCE_ENABLED is false")
-
-    if not BINANCE_TRADING_ENABLED:
-        raise Exception("BINANCE_TRADING_ENABLED is false")
-
-    if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
-        raise Exception("Binance keys missing")
-
-    if symbol_in_position(symbol):
-        raise Exception(f"Already in position for {symbol}")
-
-    if get_open_positions_count() >= MAX_OPEN_POSITIONS:
-        raise Exception("Max open positions reached")
-
-    sync_binance_time()
-
-    params = {
-        "symbol": symbol,
-        "side": "BUY",
-        "type": "MARKET",
-        "quoteOrderQty": BINANCE_BUY_QUOTE_QTY,
-    }
-
-    order = binance_signed_post("/api/v3/order", params)
-
-    avg_price = compute_average_fill_price(order)
-    qty = safe_float(order.get("executedQty"), 0.0)
-
-    if avg_price and qty and qty > 0:
-        set_position(symbol, avg_price, qty, "buy_fill")
-    else:
-        fallback_price = get_binance_last_price(symbol)
-        fallback_qty = get_sellable_base_asset_balance(symbol)
-        if fallback_qty > 0:
-            set_position(symbol, fallback_price, fallback_qty, "buy_fallback_market")
-        else:
-            raise Exception(f"Buy filled but could not determine resulting balance for {symbol}")
-
-    return order
-
-
-def place_binance_market_sell(symbol: str):
-    if not BINANCE_ENABLED:
-        raise Exception("BINANCE_ENABLED is false")
-
-    if not BINANCE_TRADING_ENABLED:
-        raise Exception("BINANCE_TRADING_ENABLED is false")
-
-    if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
-        raise Exception("Binance keys missing")
-
-    sync_binance_time()
-
-    symbol_info = get_binance_symbol_info(symbol)
-    filters = symbol_info.get("filters", [])
-
-    step_size_str = get_filter_value(filters, "LOT_SIZE", "stepSize")
-    min_qty_str = get_filter_value(filters, "LOT_SIZE", "minQty")
-
-    if not step_size_str or not min_qty_str:
-        raise Exception(f"Could not read LOT_SIZE filters for {symbol}")
-
-    step_size = float(step_size_str)
-    min_qty = float(min_qty_str)
-
-    base_balance = get_sellable_base_asset_balance(symbol)
-
-    if base_balance <= 0:
-        raise Exception(f"No base asset balance to sell for {symbol}")
-
-    sell_qty = floor_to_step(base_balance, step_size)
-
-    if sell_qty < min_qty or sell_qty <= 0:
-        raise Exception(
-            f"Sell quantity too small after rounding. balance={base_balance}, "
-            f"rounded={sell_qty}, minQty={min_qty}"
-        )
-
-    quantity_str = format_quantity(sell_qty, step_size_str)
-
-    params = {
-        "symbol": symbol,
-        "side": "SELL",
-        "type": "MARKET",
-        "quantity": quantity_str,
-    }
-
-    order = binance_signed_post("/api/v3/order", params)
-    remove_position(symbol)
-    return order
 
 # =========================
 # MARKET DISCOVERY
@@ -1142,7 +1160,7 @@ def auto_entry_loop():
                 time.sleep(AUTO_SCAN_INTERVAL_SECONDS)
                 continue
 
-            if not BINANCE_ENABLED or not BINANCE_TRADING_ENABLED:
+            if not BYBIT_TRADING_ENABLED or not bybit_keys_ready():
                 time.sleep(AUTO_SCAN_INTERVAL_SECONDS)
                 continue
 
@@ -1165,7 +1183,12 @@ def auto_entry_loop():
                     continue
                 if symbol_on_cooldown(symbol):
                     continue
-                if not is_symbol_supported_on_binance(symbol):
+                if not is_symbol_supported_on_bybit(symbol):
+                    continue
+
+                # avoid duplicate if exchange already has open long
+                exchange_pos = get_bybit_position(symbol)
+                if exchange_pos and str(exchange_pos.get("side", "")).strip() == "Buy":
                     continue
 
                 value = get_symbol_rsi(symbol, "5", 14)
@@ -1185,14 +1208,15 @@ def auto_entry_loop():
                     continue
 
                 try:
-                    order = place_binance_market_buy(symbol)
-                    avg_price = compute_average_fill_price(order)
+                    order, used_lev = place_bybit_market_buy(symbol)
                     msg = (
-                        f"🟢 AUTO BUY\n"
+                        f"🟢 AUTO BUY (BYBIT MAINNET)\n"
                         f"Symbol: {symbol}\n"
                         f"RSI(5m): {value:.2f}\n"
-                        f"Order ID: {order.get('orderId')}\n"
-                        f"Status: {order.get('status')}"
+                        f"Order ID: {order.get('result', {}).get('orderId')}\n"
+                        f"Trade size (margin): {TRADE_SIZE_USDT:.4f} USDT\n"
+                        f"Leverage used: {used_lev}x\n"
+                        f"Approx notional: {(TRADE_SIZE_USDT * used_lev):.4f} USDT"
                     )
 
                     with positions_lock:
@@ -1203,13 +1227,11 @@ def auto_entry_loop():
                             ts_text = "OFF" if pos["trailing_stop_price"] is None else f"{pos['trailing_stop_price']:.8f}"
                             msg += (
                                 f"\nEntry: {pos['entry_price']:.8f}"
+                                f"\nQty: {pos['quantity']}"
                                 f"\nStop loss: {sl_text}"
                                 f"\nTake profit: {tp_text}"
                                 f"\nTrailing stop: {ts_text}"
                             )
-
-                    if avg_price:
-                        msg += f"\nAvg fill: {avg_price:.8f}"
 
                     send_telegram(msg)
                     time.sleep(1.0)
@@ -1234,7 +1256,7 @@ def auto_exit_loop():
 
             for symbol, pos in current_positions:
                 try:
-                    current_price = get_binance_last_price(symbol)
+                    current_price = get_bybit_last_price(symbol)
                     update_position_high_water(symbol, current_price)
 
                     with positions_lock:
@@ -1259,33 +1281,31 @@ def auto_exit_loop():
                     )
 
                     if stop_loss_price is not None and current_price <= stop_loss_price:
-                        order = place_binance_market_sell(symbol)
+                        order = place_bybit_market_sell(symbol)
                         send_telegram(
                             f"🛑 STOP LOSS HIT\n"
                             f"Symbol: {symbol}\n"
                             f"Entry: {entry_price:.8f}\n"
                             f"Exit trigger: {current_price:.8f}\n"
                             f"Tracked qty: {qty}\n"
-                            f"Order ID: {order.get('orderId')}\n"
-                            f"Status: {order.get('status')}"
+                            f"Order ID: {order.get('result', {}).get('orderId')}"
                         )
                         continue
 
                     if take_profit_price is not None and current_price >= take_profit_price:
-                        order = place_binance_market_sell(symbol)
+                        order = place_bybit_market_sell(symbol)
                         send_telegram(
                             f"🎯 TAKE PROFIT HIT\n"
                             f"Symbol: {symbol}\n"
                             f"Entry: {entry_price:.8f}\n"
                             f"Exit trigger: {current_price:.8f}\n"
                             f"Tracked qty: {qty}\n"
-                            f"Order ID: {order.get('orderId')}\n"
-                            f"Status: {order.get('status')}"
+                            f"Order ID: {order.get('result', {}).get('orderId')}"
                         )
                         continue
 
                     if trailing_active and trailing_stop_price is not None and current_price <= trailing_stop_price:
-                        order = place_binance_market_sell(symbol)
+                        order = place_bybit_market_sell(symbol)
                         send_telegram(
                             f"🔒 TRAILING STOP HIT\n"
                             f"Symbol: {symbol}\n"
@@ -1294,13 +1314,12 @@ def auto_exit_loop():
                             f"Trailing stop: {trailing_stop_price:.8f}\n"
                             f"Exit trigger: {current_price:.8f}\n"
                             f"Tracked qty: {qty}\n"
-                            f"Order ID: {order.get('orderId')}\n"
-                            f"Status: {order.get('status')}"
+                            f"Order ID: {order.get('result', {}).get('orderId')}"
                         )
                         continue
 
                     if current_rsi is not None and current_rsi >= RSI_SELL_THRESHOLD:
-                        order = place_binance_market_sell(symbol)
+                        order = place_bybit_market_sell(symbol)
                         send_telegram(
                             f"🔴 AUTO SELL (RSI EXIT)\n"
                             f"Symbol: {symbol}\n"
@@ -1308,8 +1327,7 @@ def auto_exit_loop():
                             f"Entry: {entry_price:.8f}\n"
                             f"Exit trigger: {current_price:.8f}\n"
                             f"Tracked qty: {qty}\n"
-                            f"Order ID: {order.get('orderId')}\n"
-                            f"Status: {order.get('status')}"
+                            f"Order ID: {order.get('result', {}).get('orderId')}"
                         )
                         continue
 
@@ -1349,8 +1367,8 @@ def get_status_text():
         f"Live symbols: {len(live)}\n"
         f"History limit: {HISTORY_LIMIT}\n"
         f"Telegram enabled: {TELEGRAM_ENABLED}\n"
-        f"Binance enabled: {BINANCE_ENABLED}\n"
-        f"Binance trading enabled: {BINANCE_TRADING_ENABLED}\n"
+        f"Bybit trading enabled: {BYBIT_TRADING_ENABLED}\n"
+        f"Bybit keys loaded: {bybit_keys_ready()}\n"
         f"Auto trading enabled: {AUTO_TRADING_ENABLED}\n"
         f"Current open positions: {get_open_positions_count()}\n"
         f"Max open positions: {MAX_OPEN_POSITIONS}\n"
@@ -1360,7 +1378,9 @@ def get_status_text():
         f"TP: {pct_text(TAKE_PROFIT_PCT)}\n"
         f"Trailing: {pct_text(TRAILING_STOP_PCT)}\n"
         f"Trail start: {pct_text(TRAILING_START_PCT)}\n"
-        f"Binance time offset: {binance_time_offset_ms} ms"
+        f"Trade size (margin): {TRADE_SIZE_USDT:.4f} USDT\n"
+        f"Leverage: {LEVERAGE}x\n"
+        f"Approx notional/trade: {(TRADE_SIZE_USDT * LEVERAGE):.4f} USDT"
     )
 
 
@@ -1380,8 +1400,8 @@ def get_diag_text():
     with ws_lock:
         ws_keys = list(ws_connections.keys())
 
-    with binance_symbols_lock:
-        binance_count = len(binance_spot_symbols)
+    with bybit_symbols_lock:
+        bybit_count = len(bybit_linear_symbols)
 
     return (
         f"🛠 DIAG\n"
@@ -1390,8 +1410,8 @@ def get_diag_text():
         f"last_shortlist_refresh_age_sec: {last_refresh_age}\n"
         f"WS_DEBUG: {WS_DEBUG}\n"
         f"LIVE_WS_SYMBOLS: {LIVE_WS_SYMBOLS}\n"
-        f"BINANCE_ENABLED: {BINANCE_ENABLED}\n"
-        f"BINANCE_TRADING_ENABLED: {BINANCE_TRADING_ENABLED}\n"
+        f"BYBIT_TRADING_ENABLED: {BYBIT_TRADING_ENABLED}\n"
+        f"BYBIT_KEYS_READY: {bybit_keys_ready()}\n"
         f"AUTO_TRADING_ENABLED: {AUTO_TRADING_ENABLED}\n"
         f"RSI_BUY_THRESHOLD: {RSI_BUY_THRESHOLD}\n"
         f"RSI_SELL_THRESHOLD: {RSI_SELL_THRESHOLD}\n"
@@ -1400,8 +1420,9 @@ def get_diag_text():
         f"TRAILING_STOP_PCT: {TRAILING_STOP_PCT}\n"
         f"TRAILING_START_PCT: {TRAILING_START_PCT}\n"
         f"MAX_OPEN_POSITIONS: {MAX_OPEN_POSITIONS}\n"
-        f"SUPPORTED_BINANCE_USDT_SYMBOLS: {binance_count}\n"
-        f"BINANCE_TIME_OFFSET_MS: {binance_time_offset_ms}"
+        f"TRADE_SIZE_USDT: {TRADE_SIZE_USDT}\n"
+        f"LEVERAGE: {LEVERAGE}\n"
+        f"SUPPORTED_BYBIT_USDT_SYMBOLS: {bybit_count}"
     )
 
 
@@ -1410,6 +1431,7 @@ def telegram_command_loop():
     global AUTO_TRADING_ENABLED, STOP_LOSS_PCT, TAKE_PROFIT_PCT
     global TRAILING_STOP_PCT, TRAILING_START_PCT
     global RSI_BUY_THRESHOLD, RSI_SELL_THRESHOLD, MAX_OPEN_POSITIONS, SYMBOL_COOLDOWN_SECONDS
+    global TRADE_SIZE_USDT, LEVERAGE
 
     if not TELEGRAM_ENABLED:
         print("Telegram command loop disabled")
@@ -1458,46 +1480,48 @@ def telegram_command_loop():
                 elif text == "/diag":
                     send_telegram(get_diag_text())
 
-                elif text == "/binance":
-                    test_binance_connection()
+                elif text in ("/bybit", "/binance"):
+                    test_bybit_connection()
 
                 elif text == "/bbal":
                     try:
-                        send_telegram(get_binance_nonzero_balances_text())
+                        send_telegram(get_bybit_nonzero_balances_text())
                     except Exception as e:
-                        send_telegram(f"❌ Binance balance check failed\n{e}")
+                        send_telegram(f"❌ Bybit balance check failed\n{e}")
 
                 elif text == "/buy":
                     try:
-                        order = place_binance_market_buy(BINANCE_SYMBOL)
-                        avg_price = compute_average_fill_price(order)
+                        order, used_lev = place_bybit_market_buy(BYBIT_SYMBOL)
+                        sync_local_position_from_exchange(BYBIT_SYMBOL)
+
                         msg = (
-                            f"✅ Binance TESTNET BUY placed\n"
-                            f"Symbol: {order.get('symbol')}\n"
-                            f"Order ID: {order.get('orderId')}\n"
-                            f"Status: {order.get('status')}\n"
-                            f"Side: {order.get('side')}\n"
-                            f"Type: {order.get('type')}"
+                            f"✅ Bybit MAINNET BUY placed\n"
+                            f"Symbol: {BYBIT_SYMBOL}\n"
+                            f"Order ID: {order.get('result', {}).get('orderId')}\n"
+                            f"Trade size (margin): {TRADE_SIZE_USDT:.4f} USDT\n"
+                            f"Leverage used: {used_lev}x\n"
+                            f"Approx notional: {(TRADE_SIZE_USDT * used_lev):.4f} USDT"
                         )
-                        if avg_price:
-                            msg += f"\nAvg entry: {avg_price:.8f}"
+
+                        with positions_lock:
+                            pos = positions.get(BYBIT_SYMBOL)
+                            if pos:
+                                msg += f"\nAvg entry: {pos['entry_price']:.8f}\nQty: {pos['quantity']}"
+
                         send_telegram(msg)
                     except Exception as e:
-                        send_telegram(f"❌ Binance TESTNET BUY failed\n{e}")
+                        send_telegram(f"❌ Bybit MAINNET BUY failed\n{e}")
 
                 elif text == "/sell":
                     try:
-                        order = place_binance_market_sell(BINANCE_SYMBOL)
+                        order = place_bybit_market_sell(BYBIT_SYMBOL)
                         send_telegram(
-                            f"✅ Binance TESTNET SELL placed\n"
-                            f"Symbol: {order.get('symbol')}\n"
-                            f"Order ID: {order.get('orderId')}\n"
-                            f"Status: {order.get('status')}\n"
-                            f"Side: {order.get('side')}\n"
-                            f"Type: {order.get('type')}"
+                            f"✅ Bybit MAINNET SELL placed\n"
+                            f"Symbol: {BYBIT_SYMBOL}\n"
+                            f"Order ID: {order.get('result', {}).get('orderId')}"
                         )
                     except Exception as e:
-                        send_telegram(f"❌ Binance TESTNET SELL failed\n{e}")
+                        send_telegram(f"❌ Bybit MAINNET SELL failed\n{e}")
 
                 elif text == "/autoon":
                     AUTO_TRADING_ENABLED = True
@@ -1617,6 +1641,37 @@ def telegram_command_loop():
                     except Exception as e:
                         send_telegram(f"❌ Failed to set cooldown\n{e}")
 
+                elif text.startswith("/setsize "):
+                    try:
+                        value = float(text.split(maxsplit=1)[1].strip())
+                        if value <= 0:
+                            raise Exception("Trade size must be greater than 0")
+                        TRADE_SIZE_USDT = value
+                        send_telegram(
+                            f"✅ Trade size updated\n"
+                            f"Trade size (margin): {TRADE_SIZE_USDT:.4f} USDT\n"
+                            f"Leverage: {LEVERAGE}x\n"
+                            f"Approx notional/trade: {(TRADE_SIZE_USDT * LEVERAGE):.4f} USDT"
+                        )
+                    except Exception as e:
+                        send_telegram(f"❌ Failed to set trade size\n{e}")
+
+                elif text.startswith("/setlev "):
+                    try:
+                        value = int(text.split(maxsplit=1)[1].strip())
+                        if value < 1:
+                            raise Exception("Leverage must be at least 1")
+                        LEVERAGE = value
+                        send_telegram(
+                            f"✅ Leverage updated\n"
+                            f"Trade size (margin): {TRADE_SIZE_USDT:.4f} USDT\n"
+                            f"Leverage: {LEVERAGE}x\n"
+                            f"Approx notional/trade: {(TRADE_SIZE_USDT * LEVERAGE):.4f} USDT\n"
+                            f"Note: actual applied leverage may be capped per symbol by Bybit."
+                        )
+                    except Exception as e:
+                        send_telegram(f"❌ Failed to set leverage\n{e}")
+
                 elif text == "/help":
                     send_telegram(
                         "Available commands:\n"
@@ -1625,10 +1680,10 @@ def telegram_command_loop():
                         "/status - bot status\n"
                         "/symbols - live symbol sample\n"
                         "/diag - websocket diagnostics\n"
-                        "/binance - test Binance connection\n"
-                        "/bbal - Binance balances\n"
-                        "/buy - manual Binance testnet market buy for BINANCE_SYMBOL\n"
-                        "/sell - manual Binance testnet market sell for BINANCE_SYMBOL\n"
+                        "/bybit - test Bybit connection\n"
+                        "/bbal - Bybit balances\n"
+                        "/buy - manual Bybit market buy for BYBIT_SYMBOL\n"
+                        "/sell - manual Bybit market sell for BYBIT_SYMBOL\n"
                         "/autoon - enable auto trading\n"
                         "/autooff - disable auto trading\n"
                         "/showstrategy - show auto strategy\n"
@@ -1641,6 +1696,8 @@ def telegram_command_loop():
                         "/settrailstart 1 - set trailing activation percent (0 = immediate)\n"
                         "/setmaxcoins 5 - set max simultaneous open positions\n"
                         "/setcooldown 300 - set symbol cooldown seconds\n"
+                        "/setsize 20 - set trade size margin in USDT\n"
+                        "/setlev 3 - set leverage\n"
                         "/help - command list"
                     )
 
@@ -1658,7 +1715,7 @@ def shortlist_refresh_loop():
         try:
             refresh_shortlist_and_history()
             restart_websockets()
-            refresh_binance_spot_symbols()
+            refresh_bybit_linear_symbols()
         except Exception as e:
             print("Shortlist refresh error:", e)
 
@@ -1705,11 +1762,11 @@ def main():
     print("LIVE_WS_SYMBOLS =", LIVE_WS_SYMBOLS)
     print("TIMEFRAMES =", TIMEFRAMES)
     print("WS_DEBUG =", WS_DEBUG)
-    print("BINANCE_ENABLED =", BINANCE_ENABLED)
-    print("BINANCE_TRADING_ENABLED =", BINANCE_TRADING_ENABLED)
-    print("BINANCE_SYMBOL =", BINANCE_SYMBOL)
-    print("BINANCE_BASE_URL =", BINANCE_BASE_URL)
-    print("BINANCE_BUY_QUOTE_QTY =", BINANCE_BUY_QUOTE_QTY)
+    print("BYBIT_TRADING_ENABLED =", BYBIT_TRADING_ENABLED)
+    print("BYBIT_SYMBOL =", BYBIT_SYMBOL)
+    print("BYBIT_KEYS_READY =", bybit_keys_ready())
+    print("BYBIT_TRADE_SIZE_USDT =", BYBIT_TRADE_SIZE_USDT)
+    print("BYBIT_LEVERAGE =", BYBIT_LEVERAGE)
     print("DEFAULT_STOP_LOSS_PCT =", DEFAULT_STOP_LOSS_PCT)
     print("DEFAULT_TAKE_PROFIT_PCT =", DEFAULT_TAKE_PROFIT_PCT)
     print("DEFAULT_TRAILING_STOP_PCT =", DEFAULT_TRAILING_STOP_PCT)
@@ -1721,7 +1778,7 @@ def main():
     send_telegram("🚀 Scanner started")
     send_telegram("✅ Telegram test message")
 
-    test_binance_connection()
+    test_bybit_connection()
 
     threading.Thread(target=heartbeat, daemon=True).start()
     threading.Thread(target=shortlist_refresh_loop, daemon=True).start()
