@@ -32,8 +32,8 @@ TIMEFRAME_DEFAULTS = {
         "rsi": {
             "enabled": True,
             "length": 14,
-            "overbought": 70,
-            "oversold": 30,
+            "overbought": 80,
+            "oversold": 20,
         },
         "ema_distance": {
             "enabled": True,
@@ -46,8 +46,8 @@ TIMEFRAME_DEFAULTS = {
         "rsi": {
             "enabled": True,
             "length": 14,
-            "overbought": 70,
-            "oversold": 30,
+            "overbought": 80,
+            "oversold": 20,
         },
         "ema_distance": {
             "enabled": True,
