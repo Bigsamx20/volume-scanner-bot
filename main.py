@@ -94,6 +94,9 @@ last_command_time = 0
 last_ws_message_at = 0
 last_shortlist_refresh_at = 0
 
+# Binance time sync offset (ms)
+binance_time_offset_ms = 0
+
 # =========================
 # TELEGRAM
 # =========================
@@ -243,8 +246,38 @@ def binance_public_get(path: str, params=None):
 
     url = f"{BINANCE_BASE_URL}{path}"
     response = requests.get(url, params=params, timeout=10)
-    response.raise_for_status()
-    return response.json()
+
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {"raw_text": response.text}
+
+    if not response.ok:
+        raise Exception(f"Binance public GET failed {response.status_code}: {payload}")
+
+    return payload
+
+
+def sync_binance_time():
+    global binance_time_offset_ms
+
+    server_time_data = binance_public_get("/api/v3/time")
+    server_time = int(server_time_data["serverTime"])
+    local_time = int(time.time() * 1000)
+    binance_time_offset_ms = server_time - local_time
+
+    print(
+        "Binance time sync complete:",
+        {
+            "serverTime": server_time,
+            "localTime": local_time,
+            "offsetMs": binance_time_offset_ms,
+        }
+    )
+
+
+def get_binance_timestamp():
+    return int(time.time() * 1000) + binance_time_offset_ms
 
 
 def binance_signed_get(path: str, params=None):
@@ -252,8 +285,8 @@ def binance_signed_get(path: str, params=None):
         params = {}
 
     params = dict(params)
-    params["timestamp"] = int(time.time() * 1000)
-    params["recvWindow"] = 5000
+    params["timestamp"] = get_binance_timestamp()
+    params["recvWindow"] = 10000
     params["signature"] = sign_binance_params(params)
 
     url = f"{BINANCE_BASE_URL}{path}"
@@ -263,8 +296,16 @@ def binance_signed_get(path: str, params=None):
         headers=binance_headers(),
         timeout=10
     )
-    response.raise_for_status()
-    return response.json()
+
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {"raw_text": response.text}
+
+    if not response.ok:
+        raise Exception(f"Binance signed GET failed {response.status_code}: {payload}")
+
+    return payload
 
 
 def test_binance_connection():
@@ -281,6 +322,9 @@ def test_binance_connection():
         print("Testing Binance public ping...")
         ping = binance_public_get("/api/v3/ping")
         print("Binance ping OK:", ping)
+
+        print("Syncing Binance server time...")
+        sync_binance_time()
 
         print(f"Testing Binance ticker for {BINANCE_SYMBOL}...")
         ticker = binance_public_get("/api/v3/ticker/price", {"symbol": BINANCE_SYMBOL})
@@ -309,7 +353,7 @@ def test_binance_connection():
         send_telegram(
             f"✅ Binance Testnet connected\n"
             f"Symbol: {BINANCE_SYMBOL}\n"
-            f"Balances checked successfully"
+            f"Time offset: {binance_time_offset_ms} ms"
         )
 
     except Exception as e:
@@ -772,7 +816,8 @@ def get_status_text():
         f"History limit: {HISTORY_LIMIT}\n"
         f"Telegram enabled: {TELEGRAM_ENABLED}\n"
         f"Binance enabled: {BINANCE_ENABLED}\n"
-        f"Binance symbol: {BINANCE_SYMBOL}"
+        f"Binance symbol: {BINANCE_SYMBOL}\n"
+        f"Binance time offset: {binance_time_offset_ms} ms"
     )
 
 
@@ -803,7 +848,8 @@ def get_diag_text():
         f"WS_DEBUG: {WS_DEBUG}\n"
         f"LIVE_WS_SYMBOLS: {LIVE_WS_SYMBOLS}\n"
         f"BINANCE_ENABLED: {BINANCE_ENABLED}\n"
-        f"BINANCE_SYMBOL: {BINANCE_SYMBOL}"
+        f"BINANCE_SYMBOL: {BINANCE_SYMBOL}\n"
+        f"BINANCE_TIME_OFFSET_MS: {binance_time_offset_ms}"
     )
 
 
