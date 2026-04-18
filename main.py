@@ -2,6 +2,9 @@ import os
 import time
 import threading
 import requests
+import hmac
+import hashlib
+from urllib.parse import urlencode
 from copy import deepcopy
 from pybit.unified_trading import HTTP, WebSocket
 
@@ -13,8 +16,8 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 CATEGORY = os.getenv("BYBIT_CATEGORY", "linear")
-TOP_N = int(os.getenv("TOP_N", "500"))  # keep your Railway value
-LIVE_WS_SYMBOLS = int(os.getenv("LIVE_WS_SYMBOLS", "80"))  # important fix
+TOP_N = int(os.getenv("TOP_N", "500"))
+LIVE_WS_SYMBOLS = int(os.getenv("LIVE_WS_SYMBOLS", "80"))
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "300"))
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "300"))
 SHORTLIST_REFRESH_SECONDS = int(os.getenv("SHORTLIST_REFRESH_SECONDS", "300"))
@@ -23,6 +26,15 @@ HEARTBEAT_TO_TELEGRAM = os.getenv("HEARTBEAT_TO_TELEGRAM", "true").lower() == "t
 WS_DEBUG = os.getenv("WS_DEBUG", "true").lower() == "true"
 
 TIMEFRAMES = ["5", "60"]
+
+# =========================
+# BINANCE TESTNET CONFIG
+# =========================
+BINANCE_ENABLED = os.getenv("BINANCE_ENABLED", "false").lower() == "true"
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
+BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "")
+BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://testnet.binance.vision")
+BINANCE_SYMBOL = os.getenv("BINANCE_SYMBOL", "BTCUSDT")
 
 # =========================
 # DEFAULT SETTINGS
@@ -206,6 +218,103 @@ def should_alert_once_per_candle(alert_type: str, symbol: str, tf: str, candle_s
 
     last_alert_candle[key] = candle_start
     return True
+
+# =========================
+# BINANCE TESTNET HELPERS
+# =========================
+def binance_headers():
+    return {
+        "X-MBX-APIKEY": BINANCE_API_KEY
+    }
+
+
+def sign_binance_params(params: dict) -> str:
+    query_string = urlencode(params)
+    return hmac.new(
+        BINANCE_SECRET_KEY.encode("utf-8"),
+        query_string.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+
+def binance_public_get(path: str, params=None):
+    if params is None:
+        params = {}
+
+    url = f"{BINANCE_BASE_URL}{path}"
+    response = requests.get(url, params=params, timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
+def binance_signed_get(path: str, params=None):
+    if params is None:
+        params = {}
+
+    params = dict(params)
+    params["timestamp"] = int(time.time() * 1000)
+    params["recvWindow"] = 5000
+    params["signature"] = sign_binance_params(params)
+
+    url = f"{BINANCE_BASE_URL}{path}"
+    response = requests.get(
+        url,
+        params=params,
+        headers=binance_headers(),
+        timeout=10
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def test_binance_connection():
+    if not BINANCE_ENABLED:
+        print("Binance testnet disabled")
+        return
+
+    if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
+        print("Binance keys missing")
+        send_telegram("❌ Binance Testnet keys missing")
+        return
+
+    try:
+        print("Testing Binance public ping...")
+        ping = binance_public_get("/api/v3/ping")
+        print("Binance ping OK:", ping)
+
+        print(f"Testing Binance ticker for {BINANCE_SYMBOL}...")
+        ticker = binance_public_get("/api/v3/ticker/price", {"symbol": BINANCE_SYMBOL})
+        print("Binance ticker OK:", ticker)
+
+        print("Testing Binance signed account endpoint...")
+        account = binance_signed_get("/api/v3/account")
+
+        balances = account.get("balances", [])
+        non_zero = []
+
+        for b in balances:
+            free_amt = safe_float(b.get("free"), 0.0)
+            locked_amt = safe_float(b.get("locked"), 0.0)
+            if free_amt > 0 or locked_amt > 0:
+                non_zero.append(f"{b.get('asset')}: free={free_amt}, locked={locked_amt}")
+
+        print("Binance account OK")
+        if non_zero:
+            print("Non-zero balances:")
+            for row in non_zero[:10]:
+                print(" -", row)
+        else:
+            print("No non-zero balances found on testnet account")
+
+        send_telegram(
+            f"✅ Binance Testnet connected\n"
+            f"Symbol: {BINANCE_SYMBOL}\n"
+            f"Balances checked successfully"
+        )
+
+    except Exception as e:
+        print("Binance testnet connection failed:", e)
+        send_telegram(f"❌ Binance Testnet connection failed\n{e}")
 
 # =========================
 # INDICATORS
@@ -490,7 +599,6 @@ def handle_kline(msg):
             print("WS skipped: no data list", msg)
             return
 
-        # Bybit topic format: kline.{interval}.{symbol}
         topic_symbol = ""
         topic_interval = ""
 
@@ -662,7 +770,9 @@ def get_status_text():
         f"Shortlist size: {len(symbols)}\n"
         f"Live symbols: {len(live)}\n"
         f"History limit: {HISTORY_LIMIT}\n"
-        f"Telegram enabled: {TELEGRAM_ENABLED}"
+        f"Telegram enabled: {TELEGRAM_ENABLED}\n"
+        f"Binance enabled: {BINANCE_ENABLED}\n"
+        f"Binance symbol: {BINANCE_SYMBOL}"
     )
 
 
@@ -691,7 +801,9 @@ def get_diag_text():
         f"last_ws_message_age_sec: {last_ws_age}\n"
         f"last_shortlist_refresh_age_sec: {last_refresh_age}\n"
         f"WS_DEBUG: {WS_DEBUG}\n"
-        f"LIVE_WS_SYMBOLS: {LIVE_WS_SYMBOLS}"
+        f"LIVE_WS_SYMBOLS: {LIVE_WS_SYMBOLS}\n"
+        f"BINANCE_ENABLED: {BINANCE_ENABLED}\n"
+        f"BINANCE_SYMBOL: {BINANCE_SYMBOL}"
     )
 
 
@@ -745,6 +857,9 @@ def telegram_command_loop():
                 elif text == "/diag":
                     send_telegram(get_diag_text())
 
+                elif text == "/binance":
+                    test_binance_connection()
+
                 elif text == "/help":
                     send_telegram(
                         "Available commands:\n"
@@ -753,6 +868,7 @@ def telegram_command_loop():
                         "/status - bot status\n"
                         "/symbols - live symbol sample\n"
                         "/diag - websocket diagnostics\n"
+                        "/binance - test Binance connection\n"
                         "/help - command list"
                     )
 
@@ -816,9 +932,13 @@ def main():
     print("LIVE_WS_SYMBOLS =", LIVE_WS_SYMBOLS)
     print("TIMEFRAMES =", TIMEFRAMES)
     print("WS_DEBUG =", WS_DEBUG)
+    print("BINANCE_ENABLED =", BINANCE_ENABLED)
+    print("BINANCE_SYMBOL =", BINANCE_SYMBOL)
 
     send_telegram("🚀 Scanner started")
     send_telegram("✅ Telegram test message")
+
+    test_binance_connection()
 
     threading.Thread(target=heartbeat, daemon=True).start()
     threading.Thread(target=shortlist_refresh_loop, daemon=True).start()
