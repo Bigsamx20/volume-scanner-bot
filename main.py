@@ -1,3 +1,4 @@
+
 import os
 import time
 import threading
@@ -35,6 +36,10 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
 BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "").strip()
 BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://testnet.binance.vision").rstrip("/")
 BINANCE_SYMBOL = os.getenv("BINANCE_SYMBOL", "BTCUSDT").strip().upper()
+
+# Safe manual trading controls
+BINANCE_TRADING_ENABLED = os.getenv("BINANCE_TRADING_ENABLED", "false").lower() == "true"
+BINANCE_BUY_QUOTE_QTY = os.getenv("BINANCE_BUY_QUOTE_QTY", "20").strip()  # e.g. 20 USDT
 
 # =========================
 # DEFAULT SETTINGS
@@ -288,10 +293,6 @@ def binance_signed_get(path: str, params=None):
 
     url = f"{BINANCE_BASE_URL}{path}?{full_query}"
 
-    print("Binance signed GET path:", path)
-    print("Binance signed GET query:", query_string)
-    print("Binance signed GET signature:", signature)
-
     response = requests.get(
         url,
         headers=binance_headers(),
@@ -307,6 +308,59 @@ def binance_signed_get(path: str, params=None):
         raise Exception(f"Binance signed GET failed {response.status_code}: {payload}")
 
     return payload
+
+
+def binance_signed_post(path: str, params=None):
+    if params is None:
+        params = {}
+
+    params = dict(params)
+    params["timestamp"] = get_binance_timestamp()
+    params["recvWindow"] = 10000
+
+    query_string = urlencode(params, doseq=True)
+    signature = sign_binance_query_string(query_string)
+    full_query = f"{query_string}&signature={signature}"
+
+    url = f"{BINANCE_BASE_URL}{path}?{full_query}"
+
+    response = requests.post(
+        url,
+        headers=binance_headers(),
+        timeout=15
+    )
+
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {"raw_text": response.text}
+
+    if not response.ok:
+        raise Exception(f"Binance signed POST failed {response.status_code}: {payload}")
+
+    return payload
+
+
+def get_binance_account():
+    sync_binance_time()
+    return binance_signed_get("/api/v3/account")
+
+
+def get_binance_nonzero_balances_text():
+    account = get_binance_account()
+    balances = account.get("balances", [])
+
+    rows = []
+    for b in balances:
+        free_amt = safe_float(b.get("free"), 0.0)
+        locked_amt = safe_float(b.get("locked"), 0.0)
+        if free_amt > 0 or locked_amt > 0:
+            rows.append(f"{b.get('asset')}: free={free_amt}, locked={locked_amt}")
+
+    if not rows:
+        return "No non-zero Binance testnet balances found."
+
+    return "💰 Binance balances\n" + "\n".join(rows[:20])
 
 
 def test_binance_connection():
@@ -360,6 +414,29 @@ def test_binance_connection():
     except Exception as e:
         print("Binance testnet connection failed:", e)
         send_telegram(f"❌ Binance Testnet connection failed\n{e}")
+
+
+def place_binance_market_buy():
+    if not BINANCE_ENABLED:
+        raise Exception("BINANCE_ENABLED is false")
+
+    if not BINANCE_TRADING_ENABLED:
+        raise Exception("BINANCE_TRADING_ENABLED is false")
+
+    if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
+        raise Exception("Binance keys missing")
+
+    sync_binance_time()
+
+    params = {
+        "symbol": BINANCE_SYMBOL,
+        "side": "BUY",
+        "type": "MARKET",
+        "quoteOrderQty": BINANCE_BUY_QUOTE_QTY,
+    }
+
+    order = binance_signed_post("/api/v3/order", params)
+    return order
 
 # =========================
 # INDICATORS
@@ -817,7 +894,9 @@ def get_status_text():
         f"History limit: {HISTORY_LIMIT}\n"
         f"Telegram enabled: {TELEGRAM_ENABLED}\n"
         f"Binance enabled: {BINANCE_ENABLED}\n"
+        f"Binance trading enabled: {BINANCE_TRADING_ENABLED}\n"
         f"Binance symbol: {BINANCE_SYMBOL}\n"
+        f"Binance buy quote qty: {BINANCE_BUY_QUOTE_QTY}\n"
         f"Binance time offset: {binance_time_offset_ms} ms"
     )
 
@@ -846,7 +925,9 @@ def get_diag_text():
         f"WS_DEBUG: {WS_DEBUG}\n"
         f"LIVE_WS_SYMBOLS: {LIVE_WS_SYMBOLS}\n"
         f"BINANCE_ENABLED: {BINANCE_ENABLED}\n"
+        f"BINANCE_TRADING_ENABLED: {BINANCE_TRADING_ENABLED}\n"
         f"BINANCE_SYMBOL: {BINANCE_SYMBOL}\n"
+        f"BINANCE_BUY_QUOTE_QTY: {BINANCE_BUY_QUOTE_QTY}\n"
         f"BINANCE_TIME_OFFSET_MS: {binance_time_offset_ms}"
     )
 
@@ -888,16 +969,42 @@ def telegram_command_loop():
 
                 if text == "/test":
                     send_telegram("✅ Telegram command test OK")
+
                 elif text == "/force":
                     force_test_alerts()
+
                 elif text == "/status":
                     send_telegram(get_status_text())
+
                 elif text == "/symbols":
                     send_telegram(get_symbols_text())
+
                 elif text == "/diag":
                     send_telegram(get_diag_text())
+
                 elif text == "/binance":
                     test_binance_connection()
+
+                elif text == "/bbal":
+                    try:
+                        send_telegram(get_binance_nonzero_balances_text())
+                    except Exception as e:
+                        send_telegram(f"❌ Binance balance check failed\n{e}")
+
+                elif text == "/buy":
+                    try:
+                        order = place_binance_market_buy()
+                        send_telegram(
+                            f"✅ Binance TESTNET BUY placed\n"
+                            f"Symbol: {order.get('symbol')}\n"
+                            f"Order ID: {order.get('orderId')}\n"
+                            f"Status: {order.get('status')}\n"
+                            f"Side: {order.get('side')}\n"
+                            f"Type: {order.get('type')}"
+                        )
+                    except Exception as e:
+                        send_telegram(f"❌ Binance TESTNET BUY failed\n{e}")
+
                 elif text == "/help":
                     send_telegram(
                         "Available commands:\n"
@@ -907,6 +1014,8 @@ def telegram_command_loop():
                         "/symbols - live symbol sample\n"
                         "/diag - websocket diagnostics\n"
                         "/binance - test Binance connection\n"
+                        "/bbal - Binance balances\n"
+                        "/buy - manual Binance testnet market buy\n"
                         "/help - command list"
                     )
 
@@ -971,10 +1080,10 @@ def main():
     print("TIMEFRAMES =", TIMEFRAMES)
     print("WS_DEBUG =", WS_DEBUG)
     print("BINANCE_ENABLED =", BINANCE_ENABLED)
+    print("BINANCE_TRADING_ENABLED =", BINANCE_TRADING_ENABLED)
     print("BINANCE_SYMBOL =", BINANCE_SYMBOL)
     print("BINANCE_BASE_URL =", BINANCE_BASE_URL)
-    print("BINANCE_API_KEY length =", len(BINANCE_API_KEY))
-    print("BINANCE_SECRET_KEY length =", len(BINANCE_SECRET_KEY))
+    print("BINANCE_BUY_QUOTE_QTY =", BINANCE_BUY_QUOTE_QTY)
 
     send_telegram("🚀 Scanner started")
     send_telegram("✅ Telegram test message")
