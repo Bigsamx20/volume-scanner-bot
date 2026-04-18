@@ -101,7 +101,6 @@ live_symbols = set()
 shortlist_lock = threading.Lock()
 ws_lock = threading.Lock()
 positions_lock = threading.Lock()
-auto_lock = threading.Lock()
 binance_symbols_lock = threading.Lock()
 
 ws_connections = {}
@@ -256,6 +255,10 @@ def should_alert_once_per_candle(alert_type: str, symbol: str, tf: str, candle_s
 
     last_alert_candle[key] = candle_start
     return True
+
+
+def pct_text(value: float) -> str:
+    return "OFF" if value == 0 else f"{value:.2f}%"
 
 # =========================
 # INDICATORS
@@ -565,8 +568,8 @@ def symbol_on_cooldown(symbol: str) -> bool:
 
 
 def compute_risk_prices(entry_price: float):
-    stop_loss_price = entry_price * (1 - (STOP_LOSS_PCT / 100.0))
-    take_profit_price = entry_price * (1 + (TAKE_PROFIT_PCT / 100.0))
+    stop_loss_price = None if STOP_LOSS_PCT == 0 else entry_price * (1 - (STOP_LOSS_PCT / 100.0))
+    take_profit_price = None if TAKE_PROFIT_PCT == 0 else entry_price * (1 + (TAKE_PROFIT_PCT / 100.0))
     return stop_loss_price, take_profit_price
 
 
@@ -608,9 +611,11 @@ def get_positions_text():
 
         lines = ["📦 Open tracked positions"]
         for symbol, pos in positions.items():
+            sl_text = "OFF" if pos["stop_loss_price"] is None else f"{pos['stop_loss_price']:.8f}"
+            tp_text = "OFF" if pos["take_profit_price"] is None else f"{pos['take_profit_price']:.8f}"
             lines.append(
                 f"{symbol} | entry={pos['entry_price']:.8f} | qty={pos['quantity']} | "
-                f"sl={pos['stop_loss_price']:.8f} | tp={pos['take_profit_price']:.8f}"
+                f"sl={sl_text} | tp={tp_text}"
             )
         return "\n".join(lines[:30])
 
@@ -621,8 +626,8 @@ def get_strategy_text():
         f"Auto trading: {AUTO_TRADING_ENABLED}\n"
         f"Buy rule: 5m RSI <= {RSI_BUY_THRESHOLD:.2f}\n"
         f"Sell rule: 5m RSI >= {RSI_SELL_THRESHOLD:.2f} OR SL/TP\n"
-        f"Stop loss: {STOP_LOSS_PCT:.2f}%\n"
-        f"Take profit: {TAKE_PROFIT_PCT:.2f}%\n"
+        f"Stop loss: {pct_text(STOP_LOSS_PCT)}\n"
+        f"Take profit: {pct_text(TAKE_PROFIT_PCT)}\n"
         f"Max open positions: {MAX_OPEN_POSITIONS}\n"
         f"Symbol cooldown: {SYMBOL_COOLDOWN_SECONDS}s\n"
         f"Buy quote qty per trade: {BINANCE_BUY_QUOTE_QTY}\n"
@@ -1171,7 +1176,6 @@ def auto_entry_loop():
                 time.sleep(AUTO_SCAN_INTERVAL_SECONDS)
                 continue
 
-            # Prefer strongest RSI oversold first
             symbol_rsi_list = []
             for symbol in candidates:
                 if not symbol.endswith("USDT"):
@@ -1190,7 +1194,7 @@ def auto_entry_loop():
                 if value <= RSI_BUY_THRESHOLD:
                     symbol_rsi_list.append((symbol, value))
 
-            symbol_rsi_list.sort(key=lambda x: x[1])  # lowest RSI first
+            symbol_rsi_list.sort(key=lambda x: x[1])
 
             for symbol, value in symbol_rsi_list:
                 if get_open_positions_count() >= MAX_OPEN_POSITIONS:
@@ -1213,10 +1217,12 @@ def auto_entry_loop():
                     with positions_lock:
                         pos = positions.get(symbol)
                         if pos:
+                            sl_text = "OFF" if pos["stop_loss_price"] is None else f"{pos['stop_loss_price']:.8f}"
+                            tp_text = "OFF" if pos["take_profit_price"] is None else f"{pos['take_profit_price']:.8f}"
                             msg += (
                                 f"\nEntry: {pos['entry_price']:.8f}"
-                                f"\nStop loss: {pos['stop_loss_price']:.8f}"
-                                f"\nTake profit: {pos['take_profit_price']:.8f}"
+                                f"\nStop loss: {sl_text}"
+                                f"\nTake profit: {tp_text}"
                             )
 
                     if avg_price:
@@ -1258,8 +1264,7 @@ def auto_exit_loop():
                         f"entry={entry_price} sl={stop_loss_price} tp={take_profit_price} rsi={current_rsi}"
                     )
 
-                    # SL
-                    if stop_loss_price and current_price <= stop_loss_price:
+                    if stop_loss_price is not None and current_price <= stop_loss_price:
                         order = place_binance_market_sell(symbol)
                         send_telegram(
                             f"🛑 STOP LOSS HIT\n"
@@ -1272,8 +1277,7 @@ def auto_exit_loop():
                         )
                         continue
 
-                    # TP
-                    if take_profit_price and current_price >= take_profit_price:
+                    if take_profit_price is not None and current_price >= take_profit_price:
                         order = place_binance_market_sell(symbol)
                         send_telegram(
                             f"🎯 TAKE PROFIT HIT\n"
@@ -1286,7 +1290,6 @@ def auto_exit_loop():
                         )
                         continue
 
-                    # RSI exit
                     if current_rsi is not None and current_rsi >= RSI_SELL_THRESHOLD:
                         order = place_binance_market_sell(symbol)
                         send_telegram(
@@ -1351,8 +1354,8 @@ def get_status_text():
         f"Max open positions: {MAX_OPEN_POSITIONS}\n"
         f"Buy RSI <= {RSI_BUY_THRESHOLD:.2f}\n"
         f"Sell RSI >= {RSI_SELL_THRESHOLD:.2f}\n"
-        f"SL: {STOP_LOSS_PCT:.2f}%\n"
-        f"TP: {TAKE_PROFIT_PCT:.2f}%\n"
+        f"SL: {pct_text(STOP_LOSS_PCT)}\n"
+        f"TP: {pct_text(TAKE_PROFIT_PCT)}\n"
         f"Binance time offset: {binance_time_offset_ms} ms"
     )
 
@@ -1522,14 +1525,14 @@ def telegram_command_loop():
                 elif text.startswith("/setsl "):
                     try:
                         value = float(text.split(maxsplit=1)[1].strip())
-                        if value <= 0:
-                            raise Exception("Stop loss must be greater than 0")
+                        if value < 0:
+                            raise Exception("Stop loss cannot be negative")
                         STOP_LOSS_PCT = value
                         refresh_all_position_risk_levels()
                         send_telegram(
                             f"✅ Stop loss updated\n"
-                            f"Stop loss: {STOP_LOSS_PCT:.2f}%\n"
-                            f"Take profit: {TAKE_PROFIT_PCT:.2f}%"
+                            f"Stop loss: {pct_text(STOP_LOSS_PCT)}\n"
+                            f"Take profit: {pct_text(TAKE_PROFIT_PCT)}"
                         )
                     except Exception as e:
                         send_telegram(f"❌ Failed to set stop loss\n{e}")
@@ -1537,14 +1540,14 @@ def telegram_command_loop():
                 elif text.startswith("/settp "):
                     try:
                         value = float(text.split(maxsplit=1)[1].strip())
-                        if value <= 0:
-                            raise Exception("Take profit must be greater than 0")
+                        if value < 0:
+                            raise Exception("Take profit cannot be negative")
                         TAKE_PROFIT_PCT = value
                         refresh_all_position_risk_levels()
                         send_telegram(
                             f"✅ Take profit updated\n"
-                            f"Stop loss: {STOP_LOSS_PCT:.2f}%\n"
-                            f"Take profit: {TAKE_PROFIT_PCT:.2f}%"
+                            f"Stop loss: {pct_text(STOP_LOSS_PCT)}\n"
+                            f"Take profit: {pct_text(TAKE_PROFIT_PCT)}"
                         )
                     except Exception as e:
                         send_telegram(f"❌ Failed to set take profit\n{e}")
@@ -1587,8 +1590,8 @@ def telegram_command_loop():
                         "/showpositions - show tracked positions\n"
                         "/setrsibuy 15 - set buy threshold\n"
                         "/setrsisell 85 - set sell threshold\n"
-                        "/setsl 2 - set stop loss percent\n"
-                        "/settp 3 - set take profit percent\n"
+                        "/setsl 0 - set stop loss percent (0 = OFF)\n"
+                        "/settp 3 - set take profit percent (0 = OFF)\n"
                         "/setmaxcoins 5 - set max simultaneous open positions\n"
                         "/setcooldown 300 - set symbol cooldown seconds\n"
                         "/help - command list"
@@ -1641,6 +1644,165 @@ def scan_loop():
         except Exception as e:
             print("Scan loop error:", e)
             time.sleep(5)
+
+
+def auto_entry_loop():
+    while True:
+        try:
+            if not AUTO_TRADING_ENABLED:
+                time.sleep(AUTO_SCAN_INTERVAL_SECONDS)
+                continue
+
+            if not BINANCE_ENABLED or not BINANCE_TRADING_ENABLED:
+                time.sleep(AUTO_SCAN_INTERVAL_SECONDS)
+                continue
+
+            if get_open_positions_count() >= MAX_OPEN_POSITIONS:
+                time.sleep(AUTO_SCAN_INTERVAL_SECONDS)
+                continue
+
+            with shortlist_lock:
+                candidates = list(live_symbols)
+
+            if not candidates:
+                time.sleep(AUTO_SCAN_INTERVAL_SECONDS)
+                continue
+
+            symbol_rsi_list = []
+            for symbol in candidates:
+                if not symbol.endswith("USDT"):
+                    continue
+                if symbol_in_position(symbol):
+                    continue
+                if symbol_on_cooldown(symbol):
+                    continue
+                if not is_symbol_supported_on_binance(symbol):
+                    continue
+
+                value = get_symbol_rsi(symbol, "5", 14)
+                if value is None:
+                    continue
+
+                if value <= RSI_BUY_THRESHOLD:
+                    symbol_rsi_list.append((symbol, value))
+
+            symbol_rsi_list.sort(key=lambda x: x[1])
+
+            for symbol, value in symbol_rsi_list:
+                if get_open_positions_count() >= MAX_OPEN_POSITIONS:
+                    break
+
+                if symbol_in_position(symbol):
+                    continue
+
+                try:
+                    order = place_binance_market_buy(symbol)
+                    avg_price = compute_average_fill_price(order)
+                    msg = (
+                        f"🟢 AUTO BUY\n"
+                        f"Symbol: {symbol}\n"
+                        f"RSI(5m): {value:.2f}\n"
+                        f"Order ID: {order.get('orderId')}\n"
+                        f"Status: {order.get('status')}"
+                    )
+
+                    with positions_lock:
+                        pos = positions.get(symbol)
+                        if pos:
+                            sl_text = "OFF" if pos["stop_loss_price"] is None else f"{pos['stop_loss_price']:.8f}"
+                            tp_text = "OFF" if pos["take_profit_price"] is None else f"{pos['take_profit_price']:.8f}"
+                            msg += (
+                                f"\nEntry: {pos['entry_price']:.8f}"
+                                f"\nStop loss: {sl_text}"
+                                f"\nTake profit: {tp_text}"
+                            )
+
+                    if avg_price:
+                        msg += f"\nAvg fill: {avg_price:.8f}"
+
+                    send_telegram(msg)
+                    time.sleep(1.0)
+                except Exception as e:
+                    print(f"Auto buy failed for {symbol}: {e}")
+
+        except Exception as e:
+            print("Auto entry loop error:", e)
+
+        time.sleep(AUTO_SCAN_INTERVAL_SECONDS)
+
+
+def auto_exit_loop():
+    while True:
+        try:
+            with positions_lock:
+                current_positions = list(positions.items())
+
+            if not current_positions:
+                time.sleep(RISK_CHECK_INTERVAL_SECONDS)
+                continue
+
+            for symbol, pos in current_positions:
+                try:
+                    current_price = get_binance_last_price(symbol)
+                    current_rsi = get_symbol_rsi(symbol, "5", 14)
+
+                    stop_loss_price = pos["stop_loss_price"]
+                    take_profit_price = pos["take_profit_price"]
+                    entry_price = pos["entry_price"]
+                    qty = pos["quantity"]
+
+                    print(
+                        f"AUTO EXIT CHECK -> {symbol} current={current_price} "
+                        f"entry={entry_price} sl={stop_loss_price} tp={take_profit_price} rsi={current_rsi}"
+                    )
+
+                    if stop_loss_price is not None and current_price <= stop_loss_price:
+                        order = place_binance_market_sell(symbol)
+                        send_telegram(
+                            f"🛑 STOP LOSS HIT\n"
+                            f"Symbol: {symbol}\n"
+                            f"Entry: {entry_price:.8f}\n"
+                            f"Exit trigger: {current_price:.8f}\n"
+                            f"Tracked qty: {qty}\n"
+                            f"Order ID: {order.get('orderId')}\n"
+                            f"Status: {order.get('status')}"
+                        )
+                        continue
+
+                    if take_profit_price is not None and current_price >= take_profit_price:
+                        order = place_binance_market_sell(symbol)
+                        send_telegram(
+                            f"🎯 TAKE PROFIT HIT\n"
+                            f"Symbol: {symbol}\n"
+                            f"Entry: {entry_price:.8f}\n"
+                            f"Exit trigger: {current_price:.8f}\n"
+                            f"Tracked qty: {qty}\n"
+                            f"Order ID: {order.get('orderId')}\n"
+                            f"Status: {order.get('status')}"
+                        )
+                        continue
+
+                    if current_rsi is not None and current_rsi >= RSI_SELL_THRESHOLD:
+                        order = place_binance_market_sell(symbol)
+                        send_telegram(
+                            f"🔴 AUTO SELL (RSI EXIT)\n"
+                            f"Symbol: {symbol}\n"
+                            f"RSI(5m): {current_rsi:.2f}\n"
+                            f"Entry: {entry_price:.8f}\n"
+                            f"Exit trigger: {current_price:.8f}\n"
+                            f"Tracked qty: {qty}\n"
+                            f"Order ID: {order.get('orderId')}\n"
+                            f"Status: {order.get('status')}"
+                        )
+                        continue
+
+                except Exception as e:
+                    print(f"Auto exit failed for {symbol}: {e}")
+
+        except Exception as e:
+            print("Auto exit loop error:", e)
+
+        time.sleep(RISK_CHECK_INTERVAL_SECONDS)
 
 # =========================
 # MAIN
