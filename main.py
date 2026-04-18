@@ -1,6 +1,6 @@
-
 import os
 import time
+import math
 import threading
 import requests
 import hmac
@@ -37,9 +37,8 @@ BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "").strip()
 BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://testnet.binance.vision").rstrip("/")
 BINANCE_SYMBOL = os.getenv("BINANCE_SYMBOL", "BTCUSDT").strip().upper()
 
-# Safe manual trading controls
 BINANCE_TRADING_ENABLED = os.getenv("BINANCE_TRADING_ENABLED", "false").lower() == "true"
-BINANCE_BUY_QUOTE_QTY = os.getenv("BINANCE_BUY_QUOTE_QTY", "20").strip()  # e.g. 20 USDT
+BINANCE_BUY_QUOTE_QTY = os.getenv("BINANCE_BUY_QUOTE_QTY", "20").strip()
 
 # =========================
 # DEFAULT SETTINGS
@@ -363,6 +362,48 @@ def get_binance_nonzero_balances_text():
     return "💰 Binance balances\n" + "\n".join(rows[:20])
 
 
+def get_binance_symbol_info(symbol: str):
+    info = binance_public_get("/api/v3/exchangeInfo", {"symbol": symbol})
+    symbols = info.get("symbols", [])
+    if not symbols:
+        raise Exception(f"No exchange info found for {symbol}")
+    return symbols[0]
+
+
+def get_filter_value(filters, filter_type, key):
+    for f in filters:
+        if f.get("filterType") == filter_type:
+            return f.get(key)
+    return None
+
+
+def floor_to_step(value: float, step: float) -> float:
+    if step <= 0:
+        return value
+    return math.floor(value / step) * step
+
+
+def format_quantity(qty: float, step_size_str: str) -> str:
+    if "." in step_size_str:
+        decimals = len(step_size_str.rstrip("0").split(".")[1]) if "." in step_size_str.rstrip("0") else 0
+    else:
+        decimals = 0
+    formatted = f"{qty:.{decimals}f}"
+    return formatted.rstrip("0").rstrip(".") if "." in formatted else formatted
+
+
+def get_sellable_base_asset_balance(symbol: str) -> float:
+    base_asset = symbol.replace("USDT", "")
+    account = binance_signed_get("/api/v3/account")
+    balances = account.get("balances", [])
+
+    for b in balances:
+        if b.get("asset") == base_asset:
+            return safe_float(b.get("free"), 0.0)
+
+    return 0.0
+
+
 def test_binance_connection():
     if not BINANCE_ENABLED:
         print("Binance testnet disabled")
@@ -433,6 +474,56 @@ def place_binance_market_buy():
         "side": "BUY",
         "type": "MARKET",
         "quoteOrderQty": BINANCE_BUY_QUOTE_QTY,
+    }
+
+    order = binance_signed_post("/api/v3/order", params)
+    return order
+
+
+def place_binance_market_sell():
+    if not BINANCE_ENABLED:
+        raise Exception("BINANCE_ENABLED is false")
+
+    if not BINANCE_TRADING_ENABLED:
+        raise Exception("BINANCE_TRADING_ENABLED is false")
+
+    if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
+        raise Exception("Binance keys missing")
+
+    sync_binance_time()
+
+    symbol_info = get_binance_symbol_info(BINANCE_SYMBOL)
+    filters = symbol_info.get("filters", [])
+
+    step_size_str = get_filter_value(filters, "LOT_SIZE", "stepSize")
+    min_qty_str = get_filter_value(filters, "LOT_SIZE", "minQty")
+
+    if not step_size_str or not min_qty_str:
+        raise Exception(f"Could not read LOT_SIZE filters for {BINANCE_SYMBOL}")
+
+    step_size = float(step_size_str)
+    min_qty = float(min_qty_str)
+
+    base_balance = get_sellable_base_asset_balance(BINANCE_SYMBOL)
+
+    if base_balance <= 0:
+        raise Exception(f"No base asset balance to sell for {BINANCE_SYMBOL}")
+
+    sell_qty = floor_to_step(base_balance, step_size)
+
+    if sell_qty < min_qty or sell_qty <= 0:
+        raise Exception(
+            f"Sell quantity too small after rounding. balance={base_balance}, "
+            f"rounded={sell_qty}, minQty={min_qty}"
+        )
+
+    quantity_str = format_quantity(sell_qty, step_size_str)
+
+    params = {
+        "symbol": BINANCE_SYMBOL,
+        "side": "SELL",
+        "type": "MARKET",
+        "quantity": quantity_str,
     }
 
     order = binance_signed_post("/api/v3/order", params)
@@ -1005,6 +1096,20 @@ def telegram_command_loop():
                     except Exception as e:
                         send_telegram(f"❌ Binance TESTNET BUY failed\n{e}")
 
+                elif text == "/sell":
+                    try:
+                        order = place_binance_market_sell()
+                        send_telegram(
+                            f"✅ Binance TESTNET SELL placed\n"
+                            f"Symbol: {order.get('symbol')}\n"
+                            f"Order ID: {order.get('orderId')}\n"
+                            f"Status: {order.get('status')}\n"
+                            f"Side: {order.get('side')}\n"
+                            f"Type: {order.get('type')}"
+                        )
+                    except Exception as e:
+                        send_telegram(f"❌ Binance TESTNET SELL failed\n{e}")
+
                 elif text == "/help":
                     send_telegram(
                         "Available commands:\n"
@@ -1016,6 +1121,7 @@ def telegram_command_loop():
                         "/binance - test Binance connection\n"
                         "/bbal - Binance balances\n"
                         "/buy - manual Binance testnet market buy\n"
+                        "/sell - manual Binance testnet market sell\n"
                         "/help - command list"
                     )
 
