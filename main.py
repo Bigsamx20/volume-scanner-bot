@@ -46,6 +46,7 @@ BINANCE_BUY_QUOTE_QTY = os.getenv("BINANCE_BUY_QUOTE_QTY", "20").strip()
 DEFAULT_STOP_LOSS_PCT = float(os.getenv("DEFAULT_STOP_LOSS_PCT", "2.0"))
 DEFAULT_TAKE_PROFIT_PCT = float(os.getenv("DEFAULT_TAKE_PROFIT_PCT", "3.0"))
 DEFAULT_TRAILING_STOP_PCT = float(os.getenv("DEFAULT_TRAILING_STOP_PCT", "0"))
+DEFAULT_TRAILING_START_PCT = float(os.getenv("DEFAULT_TRAILING_START_PCT", "0"))
 DEFAULT_RSI_BUY = float(os.getenv("DEFAULT_RSI_BUY", "15"))
 DEFAULT_RSI_SELL = float(os.getenv("DEFAULT_RSI_SELL", "85"))
 DEFAULT_MAX_OPEN_POSITIONS = int(os.getenv("DEFAULT_MAX_OPEN_POSITIONS", "5"))
@@ -64,12 +65,6 @@ TIMEFRAME_DEFAULTS = {
             "overbought": 83,
             "oversold": 17,
         },
-        "ema_distance": {
-            "enabled": True,
-            "ema_length": 50,
-            "above_percent": 2.0,
-            "below_percent": -2.0,
-        },
     },
     "60": {
         "rsi": {
@@ -77,12 +72,6 @@ TIMEFRAME_DEFAULTS = {
             "length": 14,
             "overbought": 83,
             "oversold": 17,
-        },
-        "ema_distance": {
-            "enabled": True,
-            "ema_length": 100,
-            "above_percent": 2.0,
-            "below_percent": -2.0,
         },
     },
 }
@@ -123,6 +112,7 @@ AUTO_TRADING_ENABLED = False
 STOP_LOSS_PCT = DEFAULT_STOP_LOSS_PCT
 TAKE_PROFIT_PCT = DEFAULT_TAKE_PROFIT_PCT
 TRAILING_STOP_PCT = DEFAULT_TRAILING_STOP_PCT
+TRAILING_START_PCT = DEFAULT_TRAILING_START_PCT
 RSI_BUY_THRESHOLD = DEFAULT_RSI_BUY
 RSI_SELL_THRESHOLD = DEFAULT_RSI_SELL
 MAX_OPEN_POSITIONS = DEFAULT_MAX_OPEN_POSITIONS
@@ -265,19 +255,6 @@ def pct_text(value: float) -> str:
 # =========================
 # INDICATORS
 # =========================
-def ema(values, length=200):
-    if len(values) < length:
-        return None
-
-    multiplier = 2 / (length + 1)
-    ema_value = sum(values[:length]) / length
-
-    for value in values[length:]:
-        ema_value = ((value - ema_value) * multiplier) + ema_value
-
-    return ema_value
-
-
 def rsi(values, length=14):
     if len(values) < length + 1:
         return None
@@ -581,9 +558,20 @@ def compute_trailing_stop_price(highest_price: float):
     return highest_price * (1 - (TRAILING_STOP_PCT / 100.0))
 
 
+def trailing_should_be_active(entry_price: float, highest_price: float) -> bool:
+    if TRAILING_STOP_PCT == 0:
+        return False
+    if TRAILING_START_PCT == 0:
+        return True
+    activation_price = entry_price * (1 + (TRAILING_START_PCT / 100.0))
+    return highest_price >= activation_price
+
+
 def set_position(symbol: str, entry_price: float, quantity: float, source: str):
     stop_loss_price, take_profit_price = compute_risk_prices(entry_price)
-    trailing_stop_price = compute_trailing_stop_price(entry_price)
+
+    trailing_active = trailing_should_be_active(entry_price, entry_price)
+    trailing_stop_price = compute_trailing_stop_price(entry_price) if trailing_active else None
 
     with positions_lock:
         positions[symbol] = {
@@ -594,6 +582,7 @@ def set_position(symbol: str, entry_price: float, quantity: float, source: str):
             "take_profit_price": take_profit_price,
             "highest_price": entry_price,
             "trailing_stop_price": trailing_stop_price,
+            "trailing_active": trailing_active,
             "source": source,
             "opened_at": int(time.time()),
         }
@@ -613,7 +602,11 @@ def refresh_all_position_risk_levels():
             stop_loss_price, take_profit_price = compute_risk_prices(entry)
             pos["stop_loss_price"] = stop_loss_price
             pos["take_profit_price"] = take_profit_price
-            pos["trailing_stop_price"] = compute_trailing_stop_price(pos.get("highest_price"))
+
+            highest = pos.get("highest_price")
+            active = trailing_should_be_active(entry, highest)
+            pos["trailing_active"] = active
+            pos["trailing_stop_price"] = compute_trailing_stop_price(highest) if active else None
 
 
 def update_position_high_water(symbol: str, current_price: float):
@@ -621,10 +614,14 @@ def update_position_high_water(symbol: str, current_price: float):
         pos = positions.get(symbol)
         if not pos:
             return
+
         previous_high = pos.get("highest_price")
         if previous_high is None or current_price > previous_high:
             pos["highest_price"] = current_price
-            pos["trailing_stop_price"] = compute_trailing_stop_price(current_price)
+
+        active = trailing_should_be_active(pos["entry_price"], pos["highest_price"])
+        pos["trailing_active"] = active
+        pos["trailing_stop_price"] = compute_trailing_stop_price(pos["highest_price"]) if active else None
 
 
 def get_positions_text():
@@ -638,9 +635,10 @@ def get_positions_text():
             tp_text = "OFF" if pos["take_profit_price"] is None else f"{pos['take_profit_price']:.8f}"
             ts_text = "OFF" if pos.get("trailing_stop_price") is None else f"{pos['trailing_stop_price']:.8f}"
             hp_text = "N/A" if pos.get("highest_price") is None else f"{pos['highest_price']:.8f}"
+            ta_text = "ON" if pos.get("trailing_active") else "OFF"
             lines.append(
                 f"{symbol} | entry={pos['entry_price']:.8f} | qty={pos['quantity']} | "
-                f"sl={sl_text} | tp={tp_text} | high={hp_text} | tsl={ts_text}"
+                f"sl={sl_text} | tp={tp_text} | high={hp_text} | tsl={ts_text} | ta={ta_text}"
             )
         return "\n".join(lines[:30])
 
@@ -654,6 +652,7 @@ def get_strategy_text():
         f"Stop loss: {pct_text(STOP_LOSS_PCT)}\n"
         f"Take profit: {pct_text(TAKE_PROFIT_PCT)}\n"
         f"Trailing stop: {pct_text(TRAILING_STOP_PCT)}\n"
+        f"Trailing activation: {pct_text(TRAILING_START_PCT)}\n"
         f"Max open positions: {MAX_OPEN_POSITIONS}\n"
         f"Symbol cooldown: {SYMBOL_COOLDOWN_SECONDS}s\n"
         f"Buy quote qty per trade: {BINANCE_BUY_QUOTE_QTY}\n"
@@ -951,11 +950,8 @@ def process_indicators(symbol: str, tf: str, candle_start: int):
     if not arr:
         return
 
-    close = arr[-1]
     cfg = get_effective_settings(symbol, tf)
-
     rsi_cfg = cfg.get("rsi", {})
-    ema_cfg = cfg.get("ema_distance", {})
 
     if rsi_cfg.get("enabled", False):
         rsi_length = int(rsi_cfg.get("length", 14))
@@ -983,35 +979,6 @@ def process_indicators(symbol: str, tf: str, candle_start: int):
                         f"Timeframe: {tf}\n"
                         f"RSI: {r:.2f}\n"
                         f"Threshold: {oversold}"
-                    )
-
-    if ema_cfg.get("enabled", False):
-        ema_length = int(ema_cfg.get("ema_length", 50))
-        ema_value = ema(arr, ema_length)
-
-        if ema_value is not None and ema_value != 0:
-            dist = ((close - ema_value) / ema_value) * 100
-            above_percent = float(ema_cfg.get("above_percent", 0.5))
-            below_percent = float(ema_cfg.get("below_percent", -0.5))
-
-            if dist >= above_percent:
-                if should_alert_once_per_candle("ema_above", symbol, tf, candle_start):
-                    send_telegram(
-                        f"📈 PRICE ABOVE EMA{ema_length}\n"
-                        f"Symbol: {symbol}\n"
-                        f"Timeframe: {tf}\n"
-                        f"Distance: {dist:.2f}%\n"
-                        f"Threshold: {above_percent}%"
-                    )
-
-            if dist <= below_percent:
-                if should_alert_once_per_candle("ema_below", symbol, tf, candle_start):
-                    send_telegram(
-                        f"📉 PRICE BELOW EMA{ema_length}\n"
-                        f"Symbol: {symbol}\n"
-                        f"Timeframe: {tf}\n"
-                        f"Distance: {dist:.2f}%\n"
-                        f"Threshold: {below_percent}%"
                     )
 
 # =========================
@@ -1278,6 +1245,7 @@ def auto_exit_loop():
                         take_profit_price = refreshed["take_profit_price"]
                         trailing_stop_price = refreshed.get("trailing_stop_price")
                         highest_price = refreshed.get("highest_price")
+                        trailing_active = refreshed.get("trailing_active", False)
                         entry_price = refreshed["entry_price"]
                         qty = refreshed["quantity"]
 
@@ -1286,7 +1254,8 @@ def auto_exit_loop():
                     print(
                         f"AUTO EXIT CHECK -> {symbol} current={current_price} "
                         f"entry={entry_price} sl={stop_loss_price} tp={take_profit_price} "
-                        f"high={highest_price} tsl={trailing_stop_price} rsi={current_rsi}"
+                        f"high={highest_price} trailing_active={trailing_active} "
+                        f"tsl={trailing_stop_price} rsi={current_rsi}"
                     )
 
                     if stop_loss_price is not None and current_price <= stop_loss_price:
@@ -1315,7 +1284,7 @@ def auto_exit_loop():
                         )
                         continue
 
-                    if trailing_stop_price is not None and current_price <= trailing_stop_price:
+                    if trailing_active and trailing_stop_price is not None and current_price <= trailing_stop_price:
                         order = place_binance_market_sell(symbol)
                         send_telegram(
                             f"🔒 TRAILING STOP HIT\n"
@@ -1363,13 +1332,6 @@ def force_test_alerts():
         "RSI: 72.50\n"
         "Threshold: 70"
     )
-    send_telegram(
-        "📈 FORCE TEST EMA ALERT\n"
-        "Symbol: BTCUSDT\n"
-        "Timeframe: 60\n"
-        "Distance: 1.23%\n"
-        "Threshold: 1.0%"
-    )
 
 
 def get_status_text():
@@ -1397,6 +1359,7 @@ def get_status_text():
         f"SL: {pct_text(STOP_LOSS_PCT)}\n"
         f"TP: {pct_text(TAKE_PROFIT_PCT)}\n"
         f"Trailing: {pct_text(TRAILING_STOP_PCT)}\n"
+        f"Trail start: {pct_text(TRAILING_START_PCT)}\n"
         f"Binance time offset: {binance_time_offset_ms} ms"
     )
 
@@ -1435,6 +1398,7 @@ def get_diag_text():
         f"STOP_LOSS_PCT: {STOP_LOSS_PCT}\n"
         f"TAKE_PROFIT_PCT: {TAKE_PROFIT_PCT}\n"
         f"TRAILING_STOP_PCT: {TRAILING_STOP_PCT}\n"
+        f"TRAILING_START_PCT: {TRAILING_START_PCT}\n"
         f"MAX_OPEN_POSITIONS: {MAX_OPEN_POSITIONS}\n"
         f"SUPPORTED_BINANCE_USDT_SYMBOLS: {binance_count}\n"
         f"BINANCE_TIME_OFFSET_MS: {binance_time_offset_ms}"
@@ -1443,7 +1407,8 @@ def get_diag_text():
 
 def telegram_command_loop():
     global telegram_offset, last_command_time
-    global AUTO_TRADING_ENABLED, STOP_LOSS_PCT, TAKE_PROFIT_PCT, TRAILING_STOP_PCT
+    global AUTO_TRADING_ENABLED, STOP_LOSS_PCT, TAKE_PROFIT_PCT
+    global TRAILING_STOP_PCT, TRAILING_START_PCT
     global RSI_BUY_THRESHOLD, RSI_SELL_THRESHOLD, MAX_OPEN_POSITIONS, SYMBOL_COOLDOWN_SECONDS
 
     if not TELEGRAM_ENABLED:
@@ -1575,7 +1540,8 @@ def telegram_command_loop():
                             f"✅ Stop loss updated\n"
                             f"Stop loss: {pct_text(STOP_LOSS_PCT)}\n"
                             f"Take profit: {pct_text(TAKE_PROFIT_PCT)}\n"
-                            f"Trailing stop: {pct_text(TRAILING_STOP_PCT)}"
+                            f"Trailing stop: {pct_text(TRAILING_STOP_PCT)}\n"
+                            f"Trail start: {pct_text(TRAILING_START_PCT)}"
                         )
                     except Exception as e:
                         send_telegram(f"❌ Failed to set stop loss\n{e}")
@@ -1591,7 +1557,8 @@ def telegram_command_loop():
                             f"✅ Take profit updated\n"
                             f"Stop loss: {pct_text(STOP_LOSS_PCT)}\n"
                             f"Take profit: {pct_text(TAKE_PROFIT_PCT)}\n"
-                            f"Trailing stop: {pct_text(TRAILING_STOP_PCT)}"
+                            f"Trailing stop: {pct_text(TRAILING_STOP_PCT)}\n"
+                            f"Trail start: {pct_text(TRAILING_START_PCT)}"
                         )
                     except Exception as e:
                         send_telegram(f"❌ Failed to set take profit\n{e}")
@@ -1607,10 +1574,28 @@ def telegram_command_loop():
                             f"✅ Trailing stop updated\n"
                             f"Stop loss: {pct_text(STOP_LOSS_PCT)}\n"
                             f"Take profit: {pct_text(TAKE_PROFIT_PCT)}\n"
-                            f"Trailing stop: {pct_text(TRAILING_STOP_PCT)}"
+                            f"Trailing stop: {pct_text(TRAILING_STOP_PCT)}\n"
+                            f"Trail start: {pct_text(TRAILING_START_PCT)}"
                         )
                     except Exception as e:
                         send_telegram(f"❌ Failed to set trailing stop\n{e}")
+
+                elif text.startswith("/settrailstart "):
+                    try:
+                        value = float(text.split(maxsplit=1)[1].strip())
+                        if value < 0:
+                            raise Exception("Trailing activation cannot be negative")
+                        TRAILING_START_PCT = value
+                        refresh_all_position_risk_levels()
+                        send_telegram(
+                            f"✅ Trailing activation updated\n"
+                            f"Stop loss: {pct_text(STOP_LOSS_PCT)}\n"
+                            f"Take profit: {pct_text(TAKE_PROFIT_PCT)}\n"
+                            f"Trailing stop: {pct_text(TRAILING_STOP_PCT)}\n"
+                            f"Trail start: {pct_text(TRAILING_START_PCT)}"
+                        )
+                    except Exception as e:
+                        send_telegram(f"❌ Failed to set trailing activation\n{e}")
 
                 elif text.startswith("/setmaxcoins "):
                     try:
@@ -1653,6 +1638,7 @@ def telegram_command_loop():
                         "/setsl 0 - set stop loss percent (0 = OFF)\n"
                         "/settp 3 - set take profit percent (0 = OFF)\n"
                         "/settrailing 2 - set trailing stop percent (0 = OFF)\n"
+                        "/settrailstart 1 - set trailing activation percent (0 = immediate)\n"
                         "/setmaxcoins 5 - set max simultaneous open positions\n"
                         "/setcooldown 300 - set symbol cooldown seconds\n"
                         "/help - command list"
@@ -1727,6 +1713,7 @@ def main():
     print("DEFAULT_STOP_LOSS_PCT =", DEFAULT_STOP_LOSS_PCT)
     print("DEFAULT_TAKE_PROFIT_PCT =", DEFAULT_TAKE_PROFIT_PCT)
     print("DEFAULT_TRAILING_STOP_PCT =", DEFAULT_TRAILING_STOP_PCT)
+    print("DEFAULT_TRAILING_START_PCT =", DEFAULT_TRAILING_START_PCT)
     print("DEFAULT_RSI_BUY =", DEFAULT_RSI_BUY)
     print("DEFAULT_RSI_SELL =", DEFAULT_RSI_SELL)
     print("DEFAULT_MAX_OPEN_POSITIONS =", DEFAULT_MAX_OPEN_POSITIONS)
