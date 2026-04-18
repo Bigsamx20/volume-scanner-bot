@@ -12,8 +12,8 @@ from pybit.unified_trading import HTTP, WebSocket
 # CONFIG
 # =========================
 TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 CATEGORY = os.getenv("BYBIT_CATEGORY", "linear")
 TOP_N = int(os.getenv("TOP_N", "500"))
@@ -31,10 +31,10 @@ TIMEFRAMES = ["5", "60"]
 # BINANCE TESTNET CONFIG
 # =========================
 BINANCE_ENABLED = os.getenv("BINANCE_ENABLED", "false").lower() == "true"
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
-BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "")
-BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://testnet.binance.vision")
-BINANCE_SYMBOL = os.getenv("BINANCE_SYMBOL", "BTCUSDT")
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
+BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "").strip()
+BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://testnet.binance.vision").rstrip("/")
+BINANCE_SYMBOL = os.getenv("BINANCE_SYMBOL", "BTCUSDT").strip().upper()
 
 # =========================
 # DEFAULT SETTINGS
@@ -94,7 +94,6 @@ last_command_time = 0
 last_ws_message_at = 0
 last_shortlist_refresh_at = 0
 
-# Binance time sync offset (ms)
 binance_time_offset_ms = 0
 
 # =========================
@@ -231,8 +230,7 @@ def binance_headers():
     }
 
 
-def sign_binance_params(params: dict) -> str:
-    query_string = urlencode(params)
+def sign_binance_query_string(query_string: str) -> str:
     return hmac.new(
         BINANCE_SECRET_KEY.encode("utf-8"),
         query_string.encode("utf-8"),
@@ -245,7 +243,7 @@ def binance_public_get(path: str, params=None):
         params = {}
 
     url = f"{BINANCE_BASE_URL}{path}"
-    response = requests.get(url, params=params, timeout=10)
+    response = requests.get(url, params=params, timeout=15)
 
     try:
         payload = response.json()
@@ -266,14 +264,10 @@ def sync_binance_time():
     local_time = int(time.time() * 1000)
     binance_time_offset_ms = server_time - local_time
 
-    print(
-        "Binance time sync complete:",
-        {
-            "serverTime": server_time,
-            "localTime": local_time,
-            "offsetMs": binance_time_offset_ms,
-        }
-    )
+    print("Binance time sync:")
+    print(" server_time =", server_time)
+    print(" local_time  =", local_time)
+    print(" offset_ms   =", binance_time_offset_ms)
 
 
 def get_binance_timestamp():
@@ -287,14 +281,21 @@ def binance_signed_get(path: str, params=None):
     params = dict(params)
     params["timestamp"] = get_binance_timestamp()
     params["recvWindow"] = 10000
-    params["signature"] = sign_binance_params(params)
 
-    url = f"{BINANCE_BASE_URL}{path}"
+    query_string = urlencode(params, doseq=True)
+    signature = sign_binance_query_string(query_string)
+    full_query = f"{query_string}&signature={signature}"
+
+    url = f"{BINANCE_BASE_URL}{path}?{full_query}"
+
+    print("Binance signed GET path:", path)
+    print("Binance signed GET query:", query_string)
+    print("Binance signed GET signature:", signature)
+
     response = requests.get(
         url,
-        params=params,
         headers=binance_headers(),
-        timeout=10
+        timeout=15
     )
 
     try:
@@ -353,7 +354,7 @@ def test_binance_connection():
         send_telegram(
             f"✅ Binance Testnet connected\n"
             f"Symbol: {BINANCE_SYMBOL}\n"
-            f"Time offset: {binance_time_offset_ms} ms"
+            f"Offset: {binance_time_offset_ms} ms"
         )
 
     except Exception as e:
@@ -826,10 +827,7 @@ def get_symbols_text():
         syms = sorted(list(live_symbols))
 
     preview = syms[:40]
-    return (
-        f"📊 Live symbol count: {len(syms)}\n"
-        f"Sample:\n" + "\n".join(preview)
-    )
+    return f"📊 Live symbol count: {len(syms)}\nSample:\n" + "\n".join(preview)
 
 
 def get_diag_text():
@@ -890,22 +888,16 @@ def telegram_command_loop():
 
                 if text == "/test":
                     send_telegram("✅ Telegram command test OK")
-
                 elif text == "/force":
                     force_test_alerts()
-
                 elif text == "/status":
                     send_telegram(get_status_text())
-
                 elif text == "/symbols":
                     send_telegram(get_symbols_text())
-
                 elif text == "/diag":
                     send_telegram(get_diag_text())
-
                 elif text == "/binance":
                     test_binance_connection()
-
                 elif text == "/help":
                     send_telegram(
                         "Available commands:\n"
@@ -980,6 +972,9 @@ def main():
     print("WS_DEBUG =", WS_DEBUG)
     print("BINANCE_ENABLED =", BINANCE_ENABLED)
     print("BINANCE_SYMBOL =", BINANCE_SYMBOL)
+    print("BINANCE_BASE_URL =", BINANCE_BASE_URL)
+    print("BINANCE_API_KEY length =", len(BINANCE_API_KEY))
+    print("BINANCE_SECRET_KEY length =", len(BINANCE_SECRET_KEY))
 
     send_telegram("🚀 Scanner started")
     send_telegram("✅ Telegram test message")
