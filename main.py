@@ -38,8 +38,8 @@ TIMEFRAME_DEFAULTS = {
         "ema_distance": {
             "enabled": True,
             "ema_length": 50,
-            "above_percent": 0.5,
-            "below_percent": -0.5,
+            "above_percent": 1.0,
+            "below_percent": -1.0,
         },
     },
     "60": {
@@ -52,8 +52,8 @@ TIMEFRAME_DEFAULTS = {
         "ema_distance": {
             "enabled": True,
             "ema_length": 100,
-            "above_percent": 1.0,
-            "below_percent": -1.0,
+            "above_percent": 1.5,
+            "below_percent": -1.5,
         },
     },
 }
