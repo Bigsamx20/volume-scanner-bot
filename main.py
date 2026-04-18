@@ -13,20 +13,19 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 CATEGORY = os.getenv("BYBIT_CATEGORY", "linear")
-TOP_N = int(os.getenv("TOP_N", "500"))
+TOP_N = int(os.getenv("TOP_N", "500"))  # keep your Railway value
+LIVE_WS_SYMBOLS = int(os.getenv("LIVE_WS_SYMBOLS", "80"))  # important fix
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "300"))
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "300"))
 SHORTLIST_REFRESH_SECONDS = int(os.getenv("SHORTLIST_REFRESH_SECONDS", "300"))
 REQUEST_SLEEP_SECONDS = float(os.getenv("REQUEST_SLEEP_SECONDS", "0.12"))
 HEARTBEAT_TO_TELEGRAM = os.getenv("HEARTBEAT_TO_TELEGRAM", "true").lower() == "true"
+WS_DEBUG = os.getenv("WS_DEBUG", "true").lower() == "true"
 
-# 5m and 1h
 TIMEFRAMES = ["5", "60"]
 
 # =========================
-# DEFAULT SETTINGS FOR ALL SYMBOLS
-# These are easier to trigger than your old values
-# so you can verify alerts are working.
+# DEFAULT SETTINGS
 # =========================
 TIMEFRAME_DEFAULTS = {
     "5": {
@@ -59,33 +58,29 @@ TIMEFRAME_DEFAULTS = {
     },
 }
 
-# Optional per-symbol overrides
-SYMBOL_OVERRIDES = {
-    # Example:
-    # "BTCUSDT": {
-    #     "5": {
-    #         "rsi": {"overbought": 75, "oversold": 25}
-    #     },
-    #     "60": {
-    #         "ema_distance": {"ema_length": 200, "above_percent": 1.5, "below_percent": -1.5}
-    #     }
-    # }
-}
+SYMBOL_OVERRIDES = {}
 
 # =========================
 # GLOBALS
 # =========================
 session = HTTP(testnet=False)
+
 data = {}
 last_alert_candle = {}
 shortlist = set()
+live_symbols = set()
+
 shortlist_lock = threading.Lock()
+ws_lock = threading.Lock()
+
 ws_connections = {}
 current_candle_start = {}
 last_closed_candle_start = {}
 
 telegram_offset = 0
 last_command_time = 0
+last_ws_message_at = 0
+last_shortlist_refresh_at = 0
 
 # =========================
 # TELEGRAM
@@ -135,7 +130,6 @@ def get_telegram_updates(offset=None, timeout=20):
         print("Telegram getUpdates error:", e)
         return []
 
-
 # =========================
 # HELPERS
 # =========================
@@ -150,6 +144,13 @@ def heartbeat():
 def safe_float(value, default=None):
     try:
         return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_int(value, default=None):
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return default
 
@@ -206,7 +207,6 @@ def should_alert_once_per_candle(alert_type: str, symbol: str, tf: str, candle_s
     last_alert_candle[key] = candle_start
     return True
 
-
 # =========================
 # INDICATORS
 # =========================
@@ -248,7 +248,6 @@ def rsi(values, length=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-
 # =========================
 # MARKET DISCOVERY
 # =========================
@@ -283,10 +282,13 @@ def build_shortlist_from_tickers():
 
         candidates.append((symbol, abs(change_1h), turnover_24h))
 
-    # sort by absolute 1h move, then liquidity
     candidates.sort(key=lambda x: (x[1], x[2]), reverse=True)
     return [s for s, _, _ in candidates[:TOP_N]]
 
+
+def pick_live_symbols(symbols):
+    selected = list(symbols[:LIVE_WS_SYMBOLS])
+    return selected
 
 # =========================
 # HISTORY
@@ -327,15 +329,19 @@ def fetch_history(symbol: str, tf: str):
 
 
 def refresh_shortlist_and_history():
-    global shortlist
+    global shortlist, live_symbols, last_shortlist_refresh_at
 
     print("Refreshing shortlist...")
     symbols = build_shortlist_from_tickers()
     print(f"Shortlist size: {len(symbols)}")
 
-    new_shortlist = set(symbols)
+    selected_live_symbols = pick_live_symbols(symbols)
+    print(f"Live WS symbols: {len(selected_live_symbols)}")
 
-    for symbol in symbols:
+    new_shortlist = set(symbols)
+    new_live_symbols = set(selected_live_symbols)
+
+    for symbol in selected_live_symbols:
         ensure_symbol_state(symbol)
         for tf in TIMEFRAMES:
             fetch_history(symbol, tf)
@@ -343,9 +349,10 @@ def refresh_shortlist_and_history():
 
     with shortlist_lock:
         shortlist = new_shortlist
+        live_symbols = new_live_symbols
 
+    last_shortlist_refresh_at = int(time.time())
     print("Shortlist and history refreshed")
-
 
 # =========================
 # RANKING
@@ -354,9 +361,9 @@ def get_top_gainers_from_history(tf: str, top_n: int):
     changes = []
 
     with shortlist_lock:
-        current_shortlist = list(shortlist)
+        current_live = list(live_symbols)
 
-    for symbol in current_shortlist:
+    for symbol in current_live:
         arr = data.get(symbol, {}).get(tf, [])
         if len(arr) < 2:
             continue
@@ -372,7 +379,6 @@ def get_top_gainers_from_history(tf: str, top_n: int):
 
     changes.sort(key=lambda x: x[1], reverse=True)
     return [symbol for symbol, _ in changes[:top_n]]
-
 
 # =========================
 # SIGNALS
@@ -461,32 +467,50 @@ def process_indicators(symbol: str, tf: str, candle_start: int):
         else:
             print(f"Not enough candles for EMA{ema_length}: {symbol} {tf} len={len(arr)}")
 
-
 # =========================
 # LIVE KLINE HANDLER
 # =========================
 def handle_kline(msg):
+    global last_ws_message_at
+
     try:
+        last_ws_message_at = int(time.time())
+
+        if WS_DEBUG:
+            print("RAW WS MESSAGE:", msg)
+
         if not isinstance(msg, dict):
             print("WS skipped: message is not dict")
             return
 
+        topic = str(msg.get("topic", "")).strip()
         data_list = msg.get("data")
+
         if not isinstance(data_list, list):
             print("WS skipped: no data list", msg)
             return
 
+        # Bybit topic format: kline.{interval}.{symbol}
+        topic_symbol = ""
+        topic_interval = ""
+
+        if topic.startswith("kline."):
+            parts = topic.split(".")
+            if len(parts) >= 3:
+                topic_interval = normalize_interval(parts[1])
+                topic_symbol = parts[2].upper()
+
         with shortlist_lock:
-            current_shortlist = set(shortlist)
+            current_live_symbols = set(live_symbols)
 
         for item in data_list:
             if not isinstance(item, dict):
                 continue
 
-            symbol = str(item.get("symbol", "")).upper()
-            interval = normalize_interval(item.get("interval", ""))
+            symbol = str(item.get("symbol") or topic_symbol or "").upper()
+            interval = normalize_interval(item.get("interval") or topic_interval or "")
             close = safe_float(item.get("close"))
-            start_time = item.get("start")
+            start_time = safe_int(item.get("start"))
             confirm = bool(item.get("confirm", False))
 
             print(
@@ -495,11 +519,14 @@ def handle_kline(msg):
             )
 
             if not symbol or not interval or close is None or start_time is None:
-                print("WS skipped: missing fields")
+                print(
+                    f"WS skipped: missing fields | topic={topic} "
+                    f"symbol={symbol} interval={interval} close={close} start={start_time}"
+                )
                 continue
 
-            if symbol not in current_shortlist:
-                print(f"WS skipped: {symbol} not in shortlist")
+            if symbol not in current_live_symbols:
+                print(f"WS skipped: {symbol} not in live_symbols")
                 continue
 
             if interval not in TIMEFRAMES:
@@ -526,8 +553,7 @@ def handle_kline(msg):
                 else:
                     arr[-1] = close
 
-            # Real-time alerts, once per candle
-            process_indicators(symbol, interval, int(start_time))
+            process_indicators(symbol, interval, start_time)
 
             if confirm:
                 last_closed_candle_start[symbol][interval] = start_time
@@ -536,32 +562,49 @@ def handle_kline(msg):
     except Exception as e:
         print("WebSocket handler error:", e)
 
-
 # =========================
 # WEBSOCKET SUBSCRIPTIONS
 # =========================
+def stop_all_websockets():
+    global ws_connections
+
+    with ws_lock:
+        for key, ws in ws_connections.items():
+            try:
+                if hasattr(ws, "exit"):
+                    ws.exit()
+                    print(f"Closed WebSocket: {key}")
+            except Exception as e:
+                print(f"Error closing WebSocket {key}: {e}")
+
+        ws_connections = {}
+
+
 def start_websocket_for_timeframe(tf: str):
+    print(f"Starting WebSocket for timeframe {tf}...")
     ws = WebSocket(testnet=False, channel_type=CATEGORY)
 
     def callback(msg):
         handle_kline(msg)
 
     with shortlist_lock:
-        symbols = list(shortlist)
+        symbols = sorted(list(live_symbols))
 
     if not symbols:
         print(f"No symbols to subscribe for tf={tf}")
         return None
 
-    for symbol in symbols:
+    print(f"Subscribing {len(symbols)} symbols for tf={tf}")
+
+    for i, symbol in enumerate(symbols, start=1):
         try:
             ws.kline_stream(
                 interval=int(tf),
                 symbol=symbol,
                 callback=callback
             )
-            print(f"Subscribed live: {symbol} {tf}")
-            time.sleep(0.01)
+            print(f"Subscribed live: {symbol} {tf} ({i}/{len(symbols)})")
+            time.sleep(0.03)
         except Exception as e:
             print(f"Subscription error {symbol} {tf}: {e}")
 
@@ -570,7 +613,9 @@ def start_websocket_for_timeframe(tf: str):
 
 def restart_websockets():
     global ws_connections
+
     print("Restarting WebSocket subscriptions...")
+    stop_all_websockets()
 
     new_connections = {}
     for tf in TIMEFRAMES:
@@ -578,9 +623,10 @@ def restart_websockets():
         if ws is not None:
             new_connections[tf] = ws
 
-    ws_connections = new_connections
-    print("WebSocket subscriptions refreshed")
+    with ws_lock:
+        ws_connections = new_connections
 
+    print("WebSocket subscriptions refreshed")
 
 # =========================
 # TELEGRAM COMMANDS
@@ -605,13 +651,16 @@ def force_test_alerts():
 def get_status_text():
     with shortlist_lock:
         symbols = list(shortlist)
+        live = list(live_symbols)
 
     return (
         f"✅ Bot running\n"
         f"Category: {CATEGORY}\n"
         f"TOP_N: {TOP_N}\n"
+        f"LIVE_WS_SYMBOLS: {LIVE_WS_SYMBOLS}\n"
         f"Timeframes: {', '.join(TIMEFRAMES)}\n"
         f"Shortlist size: {len(symbols)}\n"
+        f"Live symbols: {len(live)}\n"
         f"History limit: {HISTORY_LIMIT}\n"
         f"Telegram enabled: {TELEGRAM_ENABLED}"
     )
@@ -619,12 +668,30 @@ def get_status_text():
 
 def get_symbols_text():
     with shortlist_lock:
-        symbols = sorted(list(shortlist))
+        syms = sorted(list(live_symbols))
 
-    preview = symbols[:30]
+    preview = syms[:40]
     return (
-        f"📊 Shortlist size: {len(symbols)}\n"
+        f"📊 Live symbol count: {len(syms)}\n"
         f"Sample:\n" + "\n".join(preview)
+    )
+
+
+def get_diag_text():
+    now = int(time.time())
+    last_ws_age = (now - last_ws_message_at) if last_ws_message_at else -1
+    last_refresh_age = (now - last_shortlist_refresh_at) if last_shortlist_refresh_at else -1
+
+    with ws_lock:
+        ws_keys = list(ws_connections.keys())
+
+    return (
+        f"🛠 DIAG\n"
+        f"ws_keys: {ws_keys}\n"
+        f"last_ws_message_age_sec: {last_ws_age}\n"
+        f"last_shortlist_refresh_age_sec: {last_refresh_age}\n"
+        f"WS_DEBUG: {WS_DEBUG}\n"
+        f"LIVE_WS_SYMBOLS: {LIVE_WS_SYMBOLS}"
     )
 
 
@@ -652,7 +719,6 @@ def telegram_command_loop():
                 if not text:
                     continue
 
-                # Only accept commands from your configured chat
                 if CHAT_ID and from_chat_id != str(CHAT_ID):
                     print(f"Ignoring command from unauthorized chat: {from_chat_id}")
                     continue
@@ -676,13 +742,17 @@ def telegram_command_loop():
                 elif text == "/symbols":
                     send_telegram(get_symbols_text())
 
+                elif text == "/diag":
+                    send_telegram(get_diag_text())
+
                 elif text == "/help":
                     send_telegram(
                         "Available commands:\n"
                         "/test - Telegram test\n"
                         "/force - force fake alerts\n"
                         "/status - bot status\n"
-                        "/symbols - shortlist sample\n"
+                        "/symbols - live symbol sample\n"
+                        "/diag - websocket diagnostics\n"
                         "/help - command list"
                     )
 
@@ -691,7 +761,6 @@ def telegram_command_loop():
         except Exception as e:
             print("Telegram command loop error:", e)
             time.sleep(5)
-
 
 # =========================
 # LOOPS
@@ -713,17 +782,17 @@ def scan_loop():
     while True:
         try:
             with shortlist_lock:
-                ready = len(shortlist) > 0
+                ready = len(live_symbols) > 0
 
             if not ready:
                 if first_run:
-                    print("Waiting for shortlist to finish loading...")
+                    print("Waiting for live symbols to finish loading...")
                     first_run = False
                 time.sleep(5)
                 continue
 
-            top_5m = get_top_gainers_from_history("5", min(TOP_N, 20))
-            top_1h = get_top_gainers_from_history("60", min(TOP_N, 20))
+            top_5m = get_top_gainers_from_history("5", min(LIVE_WS_SYMBOLS, 20))
+            top_1h = get_top_gainers_from_history("60", min(LIVE_WS_SYMBOLS, 20))
 
             print("Top 5m gainers:", top_5m[:10])
             print("Top 1h gainers:", top_1h[:10])
@@ -733,7 +802,6 @@ def scan_loop():
         except Exception as e:
             print("Scan loop error:", e)
             time.sleep(5)
-
 
 # =========================
 # MAIN
@@ -745,7 +813,9 @@ def main():
     print("CHAT_ID set =", bool(CHAT_ID))
     print("CATEGORY =", CATEGORY)
     print("TOP_N =", TOP_N)
+    print("LIVE_WS_SYMBOLS =", LIVE_WS_SYMBOLS)
     print("TIMEFRAMES =", TIMEFRAMES)
+    print("WS_DEBUG =", WS_DEBUG)
 
     send_telegram("🚀 Scanner started")
     send_telegram("✅ Telegram test message")
