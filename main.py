@@ -13,11 +13,22 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
-BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "true").lower() == "true"
+
+# MAINNET READY:
+# false = mainnet
+# true  = testnet
+BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
 
 # linear = perpetual/futures style symbols like BTCUSDT
-# spot = spot market
+# spot   = spot market
 BYBIT_CATEGORY = os.getenv("BYBIT_CATEGORY", "linear").strip().lower()
+
+# account type used for wallet balance checks
+# common values: UNIFIED, CONTRACT, SPOT
+BYBIT_ACCOUNT_TYPE = os.getenv("BYBIT_ACCOUNT_TYPE", "UNIFIED").strip().upper()
+
+# one-way mode default
+BYBIT_POSITION_IDX = int(os.getenv("BYBIT_POSITION_IDX", "0"))
 
 # comma-separated symbols, example: BTCUSDT,ETHUSDT,SOLUSDT
 SYMBOLS = [
@@ -46,9 +57,6 @@ HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "200"))
 
 # safety
 BYBIT_TRADING_ENABLED = os.getenv("BYBIT_TRADING_ENABLED", "false").lower() == "true"
-
-# account type for balance checks on unified accounts
-BYBIT_ACCOUNT_TYPE = os.getenv("BYBIT_ACCOUNT_TYPE", "UNIFIED").strip().upper()
 
 # =========================
 # GLOBALS
@@ -125,10 +133,8 @@ def safe_float(value, default=None):
 def should_alert_once_per_candle(alert_type: str, symbol: str, candle_start: str) -> bool:
     key = f"{alert_type}:{symbol}"
     last = last_alert_candle.get(key)
-
     if last == candle_start:
         return False
-
     last_alert_candle[key] = candle_start
     return True
 
@@ -138,6 +144,10 @@ def heartbeat():
         print("BOT ALIVE ✅")
         send_telegram("BOT ALIVE ✅")
         time.sleep(HEARTBEAT_SECONDS)
+
+
+def trading_stop_supported() -> bool:
+    return BYBIT_CATEGORY in {"linear", "inverse"}
 
 # =========================
 # RSI
@@ -217,7 +227,6 @@ def process_symbol(symbol: str, close_price: float, candle_start: str):
 
     print(f"{symbol} RSI={r:.2f}")
 
-    # normal signals
     if r <= RSI_BUY:
         if should_alert_once_per_candle("buy", symbol, candle_start):
             send_telegram(
@@ -238,7 +247,6 @@ def process_symbol(symbol: str, close_price: float, candle_start: str):
                 f"Trigger: RSI >= {RSI_SELL}"
             )
 
-    # special signals
     if SPECIAL_BUY_SIGNAL_ENABLED and r <= SPECIAL_BUY_RSI:
         if should_alert_once_per_candle("special_buy", symbol, candle_start):
             send_telegram(
@@ -264,10 +272,14 @@ def process_symbol(symbol: str, close_price: float, candle_start: str):
 # =========================
 def test_bybit_connection():
     try:
-        # unified account balance check
-        result = session.get_wallet_balance(accountType=BYBIT_ACCOUNT_TYPE)
-        send_telegram(f"✅ Bybit connected ({BYBIT_ACCOUNT_TYPE})")
-        print("Bybit connection OK:", result)
+        info = session.get_account_info()
+        result = info.get("result", {})
+        send_telegram(
+            "✅ Bybit connected\n"
+            f"Account info fetched successfully\n"
+            f"Raw result: {result}"
+        )
+        print("Bybit account info OK:", info)
     except Exception as e:
         send_telegram(f"❌ Bybit connection failed\n{e}")
         print("Bybit connection failed:", e)
@@ -276,21 +288,21 @@ def test_bybit_connection():
 def bybit_balance_text():
     try:
         result = session.get_wallet_balance(accountType=BYBIT_ACCOUNT_TYPE)
-        coins = result.get("result", {}).get("list", [])
-        if not coins:
-            return "No balance data returned."
-
+        accounts = result.get("result", {}).get("list", [])
         lines = [f"💰 Bybit balance ({BYBIT_ACCOUNT_TYPE})"]
-        for acct in coins:
-            for c in acct.get("coin", []):
-                wallet_balance = safe_float(c.get("walletBalance"), 0.0)
-                if wallet_balance and wallet_balance != 0:
-                    lines.append(f"{c.get('coin')}: {wallet_balance}")
 
-        if len(lines) == 1:
+        found = False
+        for acct in accounts:
+            for coin in acct.get("coin", []):
+                wallet_balance = safe_float(coin.get("walletBalance"), 0.0)
+                if wallet_balance and wallet_balance != 0:
+                    found = True
+                    lines.append(f"{coin.get('coin')}: {wallet_balance}")
+
+        if not found:
             lines.append("No non-zero balances found.")
 
-        return "\n".join(lines[:25])
+        return "\n".join(lines[:30])
     except Exception as e:
         return f"❌ Balance check failed\n{e}"
 
@@ -312,13 +324,14 @@ def bybit_positions_text():
                 found = True
                 lines.append(
                     f"{row.get('symbol')} | side={row.get('side')} | "
-                    f"size={row.get('size')} | avg={row.get('avgPrice')}"
+                    f"size={row.get('size')} | avg={row.get('avgPrice')} | "
+                    f"tp={row.get('takeProfit')} | sl={row.get('stopLoss')}"
                 )
 
         if not found:
             lines.append("No open positions.")
 
-        return "\n".join(lines[:25])
+        return "\n".join(lines[:30])
     except Exception as e:
         return f"❌ Position check failed\n{e}"
 
@@ -334,8 +347,6 @@ def place_bybit_market_order(symbol: str, side: str, qty: str):
     if side not in {"Buy", "Sell"}:
         raise Exception("side must be Buy or Sell")
 
-    # For linear, qty is contract quantity.
-    # For spot, qty is base-coin quantity unless you add marketUnit logic.
     result = session.place_order(
         category=BYBIT_CATEGORY,
         symbol=symbol,
@@ -343,6 +354,54 @@ def place_bybit_market_order(symbol: str, side: str, qty: str):
         orderType="Market",
         qty=str(qty),
     )
+    return result
+
+
+def set_bybit_trading_stop(symbol: str, take_profit: str = None, stop_loss: str = None):
+    if not BYBIT_TRADING_ENABLED:
+        raise Exception("BYBIT_TRADING_ENABLED is false")
+
+    if not trading_stop_supported():
+        raise Exception("Trading stop is only supported here for linear/inverse.")
+
+    params = {
+        "category": BYBIT_CATEGORY,
+        "symbol": symbol,
+        "tpslMode": "Full",
+        "positionIdx": BYBIT_POSITION_IDX,
+    }
+
+    if take_profit is not None:
+        params["takeProfit"] = str(take_profit)
+
+    if stop_loss is not None:
+        params["stopLoss"] = str(stop_loss)
+
+    result = session.set_trading_stop(**params)
+    return result
+
+
+def clear_bybit_trading_stop(symbol: str, clear_tp: bool = False, clear_sl: bool = False):
+    if not BYBIT_TRADING_ENABLED:
+        raise Exception("BYBIT_TRADING_ENABLED is false")
+
+    if not trading_stop_supported():
+        raise Exception("Trading stop is only supported here for linear/inverse.")
+
+    params = {
+        "category": BYBIT_CATEGORY,
+        "symbol": symbol,
+        "tpslMode": "Full",
+        "positionIdx": BYBIT_POSITION_IDX,
+    }
+
+    if clear_tp:
+        params["takeProfit"] = "0"
+
+    if clear_sl:
+        params["stopLoss"] = "0"
+
+    result = session.set_trading_stop(**params)
     return result
 
 # =========================
@@ -378,7 +437,6 @@ def handle_kline(msg):
             if not symbol or close is None:
                 continue
 
-            # update on every message; alert gating is once-per-candle
             process_symbol(symbol, close, start_time)
 
             if confirm:
@@ -433,7 +491,12 @@ def telegram_loop():
                         "/balance\n"
                         "/positions\n"
                         "/bybitbuy BTCUSDT 0.001\n"
-                        "/bybitsell BTCUSDT 0.001"
+                        "/bybitsell BTCUSDT 0.001\n"
+                        "/settp BTCUSDT 95000\n"
+                        "/setsl BTCUSDT 84000\n"
+                        "/setrisk BTCUSDT 84000 95000\n"
+                        "/cleartp BTCUSDT\n"
+                        "/clearsl BTCUSDT"
                     )
 
                 elif text == "/status":
@@ -441,6 +504,8 @@ def telegram_loop():
                         f"✅ Bot running\n"
                         f"Bybit category: {BYBIT_CATEGORY}\n"
                         f"Bybit testnet: {BYBIT_TESTNET}\n"
+                        f"Bybit account type: {BYBIT_ACCOUNT_TYPE}\n"
+                        f"Position idx: {BYBIT_POSITION_IDX}\n"
                         f"Symbols: {', '.join(SYMBOLS)}\n"
                         f"RSI buy <= {RSI_BUY}\n"
                         f"RSI sell >= {RSI_SELL}\n"
@@ -541,6 +606,79 @@ def telegram_loop():
                     except Exception as e:
                         send_telegram(f"❌ Bybit SELL failed\n{e}")
 
+                elif text.startswith("/settp "):
+                    try:
+                        parts = text.split()
+                        symbol = parts[1].upper()
+                        tp = parts[2]
+                        result = set_bybit_trading_stop(symbol=symbol, take_profit=tp, stop_loss=None)
+                        send_telegram(
+                            f"✅ Take profit set\n"
+                            f"Symbol: {symbol}\n"
+                            f"TP: {tp}\n"
+                            f"Result: {result.get('retMsg', 'OK')}"
+                        )
+                    except Exception as e:
+                        send_telegram(f"❌ Set TP failed\n{e}")
+
+                elif text.startswith("/setsl "):
+                    try:
+                        parts = text.split()
+                        symbol = parts[1].upper()
+                        sl = parts[2]
+                        result = set_bybit_trading_stop(symbol=symbol, take_profit=None, stop_loss=sl)
+                        send_telegram(
+                            f"✅ Stop loss set\n"
+                            f"Symbol: {symbol}\n"
+                            f"SL: {sl}\n"
+                            f"Result: {result.get('retMsg', 'OK')}"
+                        )
+                    except Exception as e:
+                        send_telegram(f"❌ Set SL failed\n{e}")
+
+                elif text.startswith("/setrisk "):
+                    try:
+                        parts = text.split()
+                        symbol = parts[1].upper()
+                        sl = parts[2]
+                        tp = parts[3]
+                        result = set_bybit_trading_stop(symbol=symbol, take_profit=tp, stop_loss=sl)
+                        send_telegram(
+                            f"✅ TP/SL set\n"
+                            f"Symbol: {symbol}\n"
+                            f"SL: {sl}\n"
+                            f"TP: {tp}\n"
+                            f"Result: {result.get('retMsg', 'OK')}"
+                        )
+                    except Exception as e:
+                        send_telegram(f"❌ Set TP/SL failed\n{e}")
+
+                elif text.startswith("/cleartp "):
+                    try:
+                        parts = text.split()
+                        symbol = parts[1].upper()
+                        result = clear_bybit_trading_stop(symbol=symbol, clear_tp=True, clear_sl=False)
+                        send_telegram(
+                            f"✅ Take profit cleared\n"
+                            f"Symbol: {symbol}\n"
+                            f"Result: {result.get('retMsg', 'OK')}"
+                        )
+                    except Exception as e:
+                        send_telegram(f"❌ Clear TP failed\n{e}")
+
+                elif text.startswith("/clearsl "):
+                    try:
+                        parts = text.split()
+                        symbol = parts[1].upper()
+                        result = clear_bybit_trading_stop(symbol=symbol, clear_tp=False, clear_sl=True)
+                        send_telegram(
+                            f"✅ Stop loss cleared\n"
+                            f"Symbol: {symbol}\n"
+                            f"Result: {result.get('retMsg', 'OK')}"
+                        )
+                    except Exception as e:
+                        send_telegram(f"❌ Clear SL failed\n{e}")
+
             time.sleep(1)
 
         except Exception as e:
@@ -575,6 +713,8 @@ def main():
     print("Starting Bybit RSI bot...")
     print("BYBIT_TESTNET =", BYBIT_TESTNET)
     print("BYBIT_CATEGORY =", BYBIT_CATEGORY)
+    print("BYBIT_ACCOUNT_TYPE =", BYBIT_ACCOUNT_TYPE)
+    print("BYBIT_POSITION_IDX =", BYBIT_POSITION_IDX)
     print("SYMBOLS =", SYMBOLS)
     print("BYBIT_TRADING_ENABLED =", BYBIT_TRADING_ENABLED)
 
