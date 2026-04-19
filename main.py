@@ -13,7 +13,8 @@ from pybit.unified_trading import HTTP, WebSocket
 # =========================
 TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+PRIVATE_CHAT_ID = os.getenv("TELEGRAM_PRIVATE_CHAT_ID", "").strip()
+GROUP_CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID", "").strip()
 
 CATEGORY = os.getenv("BYBIT_CATEGORY", "linear").strip().lower()
 TOP_N = int(os.getenv("TOP_N", "500"))
@@ -150,12 +151,9 @@ EXTREME_ALERTS_ENABLED = DEFAULT_EXTREME_ALERTS_ENABLED
 EXTREME_RSI_BUY = DEFAULT_EXTREME_RSI_BUY
 EXTREME_RSI_SELL = DEFAULT_EXTREME_RSI_SELL
 
-# positions per symbol
 positions = {}
-# cooldown per symbol
 symbol_cooldowns = {}
 
-# closed trades
 closed_trades = []
 last_daily_report_date = None
 
@@ -169,22 +167,33 @@ def send_telegram(message: str):
         print("Telegram disabled (TELEGRAM_ENABLED is not true)")
         return
 
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Telegram config missing")
+    if not BOT_TOKEN:
+        print("Telegram bot token missing")
         return
 
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        response = requests.post(
-            url,
-            json={"chat_id": CHAT_ID, "text": message},
-            timeout=10,
-        )
-        print("Telegram status:", response.status_code)
-        print("Telegram body:", response.text)
-        response.raise_for_status()
-    except Exception as e:
-        print("Telegram error:", e)
+    chat_ids = []
+    if PRIVATE_CHAT_ID:
+        chat_ids.append(PRIVATE_CHAT_ID)
+    if GROUP_CHAT_ID and GROUP_CHAT_ID not in chat_ids:
+        chat_ids.append(GROUP_CHAT_ID)
+
+    if not chat_ids:
+        print("Telegram chat IDs missing")
+        return
+
+    for chat_id in chat_ids:
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+            response = requests.post(
+                url,
+                json={"chat_id": chat_id, "text": message},
+                timeout=10,
+            )
+            print(f"Telegram status for {chat_id}:", response.status_code)
+            print(f"Telegram body for {chat_id}:", response.text)
+            response.raise_for_status()
+        except Exception as e:
+            print(f"Telegram error for {chat_id}:", e)
 
 
 def get_telegram_updates(offset=None, timeout=20):
@@ -1683,11 +1692,12 @@ def telegram_command_loop():
                 if not text:
                     continue
 
-                if CHAT_ID and from_chat_id != str(CHAT_ID):
+                # Commands allowed ONLY from your private chat
+                if PRIVATE_CHAT_ID and from_chat_id != str(PRIVATE_CHAT_ID):
                     print(f"Ignoring command from unauthorized chat: {from_chat_id}")
                     continue
 
-                print(f"Telegram command received: {text}")
+                print(f"Telegram command received: {text} | chat_id={from_chat_id}")
 
                 now = time.time()
                 if now - last_command_time < 1:
@@ -2110,7 +2120,8 @@ def main():
     print("Starting scanner...")
     print("TELEGRAM_ENABLED =", TELEGRAM_ENABLED)
     print("BOT_TOKEN set =", bool(BOT_TOKEN))
-    print("CHAT_ID set =", bool(CHAT_ID))
+    print("PRIVATE_CHAT_ID set =", bool(PRIVATE_CHAT_ID))
+    print("GROUP_CHAT_ID set =", bool(GROUP_CHAT_ID))
     print("CATEGORY =", CATEGORY)
     print("TOP_N =", TOP_N)
     print("LIVE_WS_SYMBOLS =", LIVE_WS_SYMBOLS)
