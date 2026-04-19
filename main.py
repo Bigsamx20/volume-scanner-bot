@@ -14,6 +14,7 @@ from pybit.unified_trading import HTTP, WebSocket
 TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+GROUP_CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID", "").strip()
 
 CATEGORY = os.getenv("BYBIT_CATEGORY", "linear").strip().lower()
 TOP_N = int(os.getenv("TOP_N", "500"))
