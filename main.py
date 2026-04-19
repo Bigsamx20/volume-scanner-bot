@@ -5,6 +5,7 @@ import threading
 import requests
 from copy import deepcopy
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
+from datetime import datetime
 from pybit.unified_trading import HTTP, WebSocket
 
 # =========================
@@ -34,8 +35,6 @@ BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
 BYBIT_TRADING_ENABLED = os.getenv("BYBIT_TRADING_ENABLED", "false").lower() == "true"
 BYBIT_SYMBOL = os.getenv("BYBIT_SYMBOL", "BTCUSDT").strip().upper()
 
-# Trade size is treated as margin in USDT.
-# Effective position notional ~= TRADE_SIZE_USDT * LEVERAGE.
 BYBIT_TRADE_SIZE_USDT = float(os.getenv("BYBIT_TRADE_SIZE_USDT", "20"))
 BYBIT_LEVERAGE = int(os.getenv("BYBIT_LEVERAGE", "1"))
 
@@ -59,6 +58,13 @@ AUTO_SCAN_INTERVAL_SECONDS = float(os.getenv("AUTO_SCAN_INTERVAL_SECONDS", "10")
 DEFAULT_EXTREME_ALERTS_ENABLED = os.getenv("EXTREME_ALERTS_ENABLED", "true").lower() == "true"
 DEFAULT_EXTREME_RSI_BUY = float(os.getenv("EXTREME_RSI_BUY", "10"))
 DEFAULT_EXTREME_RSI_SELL = float(os.getenv("EXTREME_RSI_SELL", "90"))
+
+# =========================
+# PNL / REPORTING CONFIG
+# =========================
+TRADES_HISTORY_LIMIT = int(os.getenv("TRADES_HISTORY_LIMIT", "500"))
+DAILY_REPORT_ENABLED = os.getenv("DAILY_REPORT_ENABLED", "false").lower() == "true"
+DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "21"))
 
 # =========================
 # DEFAULT SETTINGS
@@ -111,6 +117,7 @@ shortlist_lock = threading.Lock()
 ws_lock = threading.Lock()
 positions_lock = threading.Lock()
 bybit_symbols_lock = threading.Lock()
+trades_lock = threading.Lock()
 
 ws_connections = {}
 current_candle_start = {}
@@ -147,6 +154,10 @@ EXTREME_RSI_SELL = DEFAULT_EXTREME_RSI_SELL
 positions = {}
 # cooldown per symbol
 symbol_cooldowns = {}
+
+# closed trades
+closed_trades = []
+last_daily_report_date = None
 
 # =========================
 # TELEGRAM
@@ -310,6 +321,18 @@ def fmt_qty_or_price(value) -> str:
     if "." in s:
         s = s.rstrip("0").rstrip(".")
     return s
+
+
+def now_ts():
+    return int(time.time())
+
+
+def ts_to_text(ts: int) -> str:
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def today_str_from_ts(ts: int) -> str:
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
 
 # =========================
 # INDICATORS
@@ -489,6 +512,36 @@ def get_bybit_position(symbol: str):
     return None
 
 
+def get_bybit_all_open_long_positions():
+    positions_found = []
+    cursor = None
+
+    while True:
+        params = {
+            "category": CATEGORY,
+            "limit": 200,
+        }
+        if cursor:
+            params["cursor"] = cursor
+
+        response = session.get_positions(**params)
+        result = response.get("result", {})
+        rows = result.get("list", [])
+
+        for row in rows:
+            size = safe_float(row.get("size"), 0.0)
+            side = str(row.get("side", "")).strip()
+            symbol = str(row.get("symbol", "")).upper()
+            if symbol and side == "Buy" and size and size > 0:
+                positions_found.append(row)
+
+        cursor = result.get("nextPageCursor")
+        if not cursor:
+            break
+
+    return positions_found
+
+
 def get_bybit_position_size(symbol: str) -> float:
     pos = get_bybit_position(symbol)
     if not pos:
@@ -603,126 +656,8 @@ def ensure_bybit_leverage(symbol: str):
 
         raise
 
-
-def place_bybit_market_buy(symbol: str):
-    if CATEGORY != "linear":
-        raise Exception("This version is built for BYBIT_CATEGORY=linear")
-
-    if not BYBIT_TRADING_ENABLED:
-        raise Exception("BYBIT_TRADING_ENABLED is false")
-
-    if not bybit_keys_ready():
-        raise Exception("Bybit API keys missing")
-
-    if symbol_in_position(symbol):
-        raise Exception(f"Already in tracked position for {symbol}")
-
-    exchange_pos = get_bybit_position(symbol)
-    if exchange_pos and str(exchange_pos.get("side", "")) == "Buy":
-        raise Exception(f"Exchange already shows an open Buy position for {symbol}")
-
-    if get_open_positions_count() >= MAX_OPEN_POSITIONS:
-        raise Exception("Max open positions reached")
-
-    available_balance = get_bybit_total_available_balance_usd()
-    if available_balance <= 0:
-        raise Exception("No available balance on Bybit account")
-
-    target_leverage = ensure_bybit_leverage(symbol)
-    last_price = get_bybit_last_price(symbol)
-    qty_str, qty, _ = compute_bybit_order_qty(symbol, last_price)
-
-    order = session.place_order(
-        category=CATEGORY,
-        symbol=symbol,
-        side="Buy",
-        orderType="Market",
-        qty=qty_str,
-    )
-
-    time.sleep(1.0)
-
-    if not sync_local_position_from_exchange(symbol):
-        fallback_entry = get_bybit_last_price(symbol)
-        set_position(symbol, fallback_entry, qty, "buy_fallback_market")
-
-    return order, target_leverage
-
-
-def place_bybit_market_sell(symbol: str):
-    if CATEGORY != "linear":
-        raise Exception("This version is built for BYBIT_CATEGORY=linear")
-
-    if not BYBIT_TRADING_ENABLED:
-        raise Exception("BYBIT_TRADING_ENABLED is false")
-
-    if not bybit_keys_ready():
-        raise Exception("Bybit API keys missing")
-
-    pos = get_bybit_position(symbol)
-    if not pos:
-        raise Exception(f"No open exchange position found for {symbol}")
-
-    side = str(pos.get("side", "")).strip()
-    size = safe_float(pos.get("size"), 0.0)
-
-    if side != "Buy" or size <= 0:
-        raise Exception(f"No open long position to close for {symbol}")
-
-    instrument = get_bybit_instrument_info(symbol)
-    qty_step = str(instrument.get("lotSizeFilter", {}).get("qtyStep", "0.001"))
-    qty_str = fmt_qty_or_price(floor_to_step_str(size, qty_step))
-    qty_val = safe_float(qty_str, 0.0)
-
-    if qty_val <= 0:
-        raise Exception(f"Rounded close quantity became 0 for {symbol}")
-
-    order = session.place_order(
-        category=CATEGORY,
-        symbol=symbol,
-        side="Sell",
-        orderType="Market",
-        qty=qty_str,
-        reduceOnly=True,
-    )
-
-    time.sleep(1.0)
-    remove_position(symbol)
-    return order
-
-
-def test_bybit_connection():
-    if CATEGORY != "linear":
-        print(f"Warning: current CATEGORY={CATEGORY}, but this bot is intended for linear.")
-
-    if not bybit_keys_ready():
-        print("Bybit keys missing")
-        send_telegram("❌ Bybit mainnet keys missing")
-        return
-
-    try:
-        print("Testing Bybit market data...")
-        ticker = session.get_tickers(category=CATEGORY, symbol=BYBIT_SYMBOL)
-        print("Bybit ticker OK:", ticker)
-
-        print("Testing Bybit wallet balance endpoint...")
-        account = get_bybit_account_wallet()
-        print("Bybit wallet OK:", account)
-
-        refresh_bybit_linear_symbols()
-
-        send_telegram(
-            f"✅ Bybit MAINNET connected\n"
-            f"Category: {CATEGORY}\n"
-            f"Symbol: {BYBIT_SYMBOL}\n"
-            f"Trading enabled: {BYBIT_TRADING_ENABLED}"
-        )
-    except Exception as e:
-        print("Bybit mainnet connection failed:", e)
-        send_telegram(f"❌ Bybit MAINNET connection failed\n{e}")
-
 # =========================
-# POSITION / AUTO STATE
+# POSITION / PNL HELPERS
 # =========================
 def get_open_positions_count():
     with positions_lock:
@@ -787,11 +722,51 @@ def set_position(symbol: str, entry_price: float, quantity: float, source: str):
         }
 
 
+def record_closed_trade(symbol: str, exit_price: float, reason: str):
+    with positions_lock:
+        pos = positions.get(symbol)
+        if not pos:
+            return None
+
+        entry_price = pos["entry_price"]
+        quantity = pos["quantity"]
+        opened_at = pos.get("opened_at", now_ts())
+
+    pnl_usdt = (exit_price - entry_price) * quantity
+    pnl_pct = 0.0 if entry_price <= 0 else ((exit_price - entry_price) / entry_price) * 100.0
+    closed_at = now_ts()
+
+    trade = {
+        "symbol": symbol,
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "quantity": quantity,
+        "pnl_usdt": pnl_usdt,
+        "pnl_pct": pnl_pct,
+        "reason": reason,
+        "opened_at": opened_at,
+        "closed_at": closed_at,
+    }
+
+    with trades_lock:
+        closed_trades.append(trade)
+        if len(closed_trades) > TRADES_HISTORY_LIMIT:
+            del closed_trades[0:len(closed_trades) - TRADES_HISTORY_LIMIT]
+
+    return trade
+
+
 def remove_position(symbol: str):
     with positions_lock:
         if symbol in positions:
             del positions[symbol]
     set_symbol_cooldown(symbol)
+
+
+def close_local_position_and_record(symbol: str, exit_price: float, reason: str):
+    trade = record_closed_trade(symbol, exit_price, reason)
+    remove_position(symbol)
+    return trade
 
 
 def refresh_all_position_risk_levels():
@@ -861,8 +836,88 @@ def get_strategy_text():
         f"Trade size (margin): {TRADE_SIZE_USDT:.4f} USDT\n"
         f"Leverage: {LEVERAGE}x\n"
         f"Approx position notional/trade: {(TRADE_SIZE_USDT * LEVERAGE):.4f} USDT\n"
+        f"Daily report enabled: {DAILY_REPORT_ENABLED}\n"
+        f"Daily report hour: {DAILY_REPORT_HOUR}\n"
         f"Current open positions: {get_open_positions_count()}"
     )
+
+
+def get_pnl_summary_data(day_filter=None):
+    with trades_lock:
+        trades = list(closed_trades)
+
+    if day_filter:
+        trades = [t for t in trades if today_str_from_ts(t["closed_at"]) == day_filter]
+
+    total = len(trades)
+    wins = len([t for t in trades if t["pnl_usdt"] > 0])
+    losses = len([t for t in trades if t["pnl_usdt"] < 0])
+    flat = total - wins - losses
+    total_pnl = sum(t["pnl_usdt"] for t in trades)
+
+    best_trade = max(trades, key=lambda x: x["pnl_usdt"]) if trades else None
+    worst_trade = min(trades, key=lambda x: x["pnl_usdt"]) if trades else None
+    win_rate = 0.0 if total == 0 else (wins / total) * 100.0
+
+    return {
+        "trades": trades,
+        "total": total,
+        "wins": wins,
+        "losses": losses,
+        "flat": flat,
+        "total_pnl": total_pnl,
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+        "win_rate": win_rate,
+    }
+
+
+def get_pnl_text(day_filter=None):
+    summary = get_pnl_summary_data(day_filter=day_filter)
+    label = "TODAY" if day_filter else "ALL TIME"
+
+    lines = [
+        f"📊 PNL SUMMARY ({label})",
+        f"Trades: {summary['total']}",
+        f"Wins: {summary['wins']}",
+        f"Losses: {summary['losses']}",
+        f"Flat: {summary['flat']}",
+        f"Win rate: {summary['win_rate']:.2f}%",
+        f"Total PnL: {summary['total_pnl']:.8f} USDT",
+    ]
+
+    if summary["best_trade"]:
+        bt = summary["best_trade"]
+        lines.append(
+            f"Best: {bt['symbol']} {bt['pnl_usdt']:.8f} USDT ({bt['pnl_pct']:.2f}%)"
+        )
+
+    if summary["worst_trade"]:
+        wt = summary["worst_trade"]
+        lines.append(
+            f"Worst: {wt['symbol']} {wt['pnl_usdt']:.8f} USDT ({wt['pnl_pct']:.2f}%)"
+        )
+
+    return "\n".join(lines)
+
+
+def get_recent_trades_text(limit=10):
+    with trades_lock:
+        trades = list(closed_trades)[-limit:]
+
+    if not trades:
+        return "📭 No closed trades yet."
+
+    trades.reverse()
+    lines = ["🧾 RECENT CLOSED TRADES"]
+    for t in trades:
+        lines.append(
+            f"{t['symbol']} | pnl={t['pnl_usdt']:.8f} USDT ({t['pnl_pct']:.2f}%) | "
+            f"reason={t['reason']} | entry={t['entry_price']:.8f} | exit={t['exit_price']:.8f} | "
+            f"qty={t['quantity']} | closed={ts_to_text(t['closed_at'])}"
+        )
+
+    return "\n".join(lines[:25])
 
 # =========================
 # MARKET DISCOVERY
@@ -1182,6 +1237,126 @@ def restart_websockets():
     print("WebSocket subscriptions refreshed")
 
 # =========================
+# ORDER HELPERS
+# =========================
+def place_bybit_market_buy(symbol: str):
+    if CATEGORY != "linear":
+        raise Exception("This version is built for BYBIT_CATEGORY=linear")
+
+    if not BYBIT_TRADING_ENABLED:
+        raise Exception("BYBIT_TRADING_ENABLED is false")
+
+    if not bybit_keys_ready():
+        raise Exception("Bybit API keys missing")
+
+    if symbol_in_position(symbol):
+        raise Exception(f"Already in tracked position for {symbol}")
+
+    exchange_pos = get_bybit_position(symbol)
+    if exchange_pos and str(exchange_pos.get("side", "")) == "Buy":
+        raise Exception(f"Exchange already shows an open Buy position for {symbol}")
+
+    if get_open_positions_count() >= MAX_OPEN_POSITIONS:
+        raise Exception("Max open positions reached")
+
+    available_balance = get_bybit_total_available_balance_usd()
+    if available_balance <= 0:
+        raise Exception("No available balance on Bybit account")
+
+    target_leverage = ensure_bybit_leverage(symbol)
+    last_price = get_bybit_last_price(symbol)
+    qty_str, qty, _ = compute_bybit_order_qty(symbol, last_price)
+
+    order = session.place_order(
+        category=CATEGORY,
+        symbol=symbol,
+        side="Buy",
+        orderType="Market",
+        qty=qty_str,
+    )
+
+    time.sleep(1.0)
+
+    if not sync_local_position_from_exchange(symbol):
+        fallback_entry = get_bybit_last_price(symbol)
+        set_position(symbol, fallback_entry, qty, "buy_fallback_market")
+
+    return order, target_leverage
+
+
+def place_bybit_market_sell(symbol: str, reason: str = "manual_sell"):
+    if CATEGORY != "linear":
+        raise Exception("This version is built for BYBIT_CATEGORY=linear")
+
+    if not BYBIT_TRADING_ENABLED:
+        raise Exception("BYBIT_TRADING_ENABLED is false")
+
+    if not bybit_keys_ready():
+        raise Exception("Bybit API keys missing")
+
+    pos = get_bybit_position(symbol)
+    if not pos:
+        raise Exception(f"No open exchange position found for {symbol}")
+
+    side = str(pos.get("side", "")).strip()
+    size = safe_float(pos.get("size"), 0.0)
+
+    if side != "Buy" or size <= 0:
+        raise Exception(f"No open long position to close for {symbol}")
+
+    instrument = get_bybit_instrument_info(symbol)
+    qty_step = str(instrument.get("lotSizeFilter", {}).get("qtyStep", "0.001"))
+    qty_str = fmt_qty_or_price(floor_to_step_str(size, qty_step))
+    qty_val = safe_float(qty_str, 0.0)
+
+    if qty_val <= 0:
+        raise Exception(f"Rounded close quantity became 0 for {symbol}")
+
+    order = session.place_order(
+        category=CATEGORY,
+        symbol=symbol,
+        side="Sell",
+        orderType="Market",
+        qty=qty_str,
+        reduceOnly=True,
+    )
+
+    time.sleep(1.0)
+    exit_price = get_bybit_last_price(symbol)
+    trade = close_local_position_and_record(symbol, exit_price, reason)
+    return order, trade
+
+
+def panic_close_all_positions():
+    if CATEGORY != "linear":
+        raise Exception("This version is built for BYBIT_CATEGORY=linear")
+
+    if not BYBIT_TRADING_ENABLED:
+        raise Exception("BYBIT_TRADING_ENABLED is false")
+
+    if not bybit_keys_ready():
+        raise Exception("Bybit API keys missing")
+
+    exchange_positions = get_bybit_all_open_long_positions()
+    if not exchange_positions:
+        return [], []
+
+    closed_symbols = []
+    errors = []
+
+    for pos in exchange_positions:
+        symbol = str(pos.get("symbol", "")).upper()
+        try:
+            sync_local_position_from_exchange(symbol)
+            place_bybit_market_sell(symbol, reason="panic_close")
+            closed_symbols.append(symbol)
+            time.sleep(0.3)
+        except Exception as e:
+            errors.append(f"{symbol}: {e}")
+
+    return closed_symbols, errors
+
+# =========================
 # AUTO TRADING
 # =========================
 def get_symbol_rsi(symbol: str, tf: str = "5", length: int = 14):
@@ -1318,31 +1493,34 @@ def auto_exit_loop():
                     )
 
                     if stop_loss_price is not None and current_price <= stop_loss_price:
-                        order = place_bybit_market_sell(symbol)
+                        order, trade = place_bybit_market_sell(symbol, reason="stop_loss")
+                        pnl_text = "" if not trade else f"\nPnL: {trade['pnl_usdt']:.8f} USDT ({trade['pnl_pct']:.2f}%)"
                         send_telegram(
                             f"🛑 STOP LOSS HIT\n"
                             f"Symbol: {symbol}\n"
                             f"Entry: {entry_price:.8f}\n"
                             f"Exit trigger: {current_price:.8f}\n"
                             f"Tracked qty: {qty}\n"
-                            f"Order ID: {order.get('result', {}).get('orderId')}"
+                            f"Order ID: {order.get('result', {}).get('orderId')}{pnl_text}"
                         )
                         continue
 
                     if take_profit_price is not None and current_price >= take_profit_price:
-                        order = place_bybit_market_sell(symbol)
+                        order, trade = place_bybit_market_sell(symbol, reason="take_profit")
+                        pnl_text = "" if not trade else f"\nPnL: {trade['pnl_usdt']:.8f} USDT ({trade['pnl_pct']:.2f}%)"
                         send_telegram(
                             f"🎯 TAKE PROFIT HIT\n"
                             f"Symbol: {symbol}\n"
                             f"Entry: {entry_price:.8f}\n"
                             f"Exit trigger: {current_price:.8f}\n"
                             f"Tracked qty: {qty}\n"
-                            f"Order ID: {order.get('result', {}).get('orderId')}"
+                            f"Order ID: {order.get('result', {}).get('orderId')}{pnl_text}"
                         )
                         continue
 
                     if trailing_active and trailing_stop_price is not None and current_price <= trailing_stop_price:
-                        order = place_bybit_market_sell(symbol)
+                        order, trade = place_bybit_market_sell(symbol, reason="trailing_stop")
+                        pnl_text = "" if not trade else f"\nPnL: {trade['pnl_usdt']:.8f} USDT ({trade['pnl_pct']:.2f}%)"
                         send_telegram(
                             f"🔒 TRAILING STOP HIT\n"
                             f"Symbol: {symbol}\n"
@@ -1351,12 +1529,13 @@ def auto_exit_loop():
                             f"Trailing stop: {trailing_stop_price:.8f}\n"
                             f"Exit trigger: {current_price:.8f}\n"
                             f"Tracked qty: {qty}\n"
-                            f"Order ID: {order.get('result', {}).get('orderId')}"
+                            f"Order ID: {order.get('result', {}).get('orderId')}{pnl_text}"
                         )
                         continue
 
                     if current_rsi is not None and current_rsi >= RSI_SELL_THRESHOLD:
-                        order = place_bybit_market_sell(symbol)
+                        order, trade = place_bybit_market_sell(symbol, reason="rsi_exit")
+                        pnl_text = "" if not trade else f"\nPnL: {trade['pnl_usdt']:.8f} USDT ({trade['pnl_pct']:.2f}%)"
                         send_telegram(
                             f"🔴 AUTO SELL (RSI EXIT)\n"
                             f"Symbol: {symbol}\n"
@@ -1364,7 +1543,7 @@ def auto_exit_loop():
                             f"Entry: {entry_price:.8f}\n"
                             f"Exit trigger: {current_price:.8f}\n"
                             f"Tracked qty: {qty}\n"
-                            f"Order ID: {order.get('result', {}).get('orderId')}"
+                            f"Order ID: {order.get('result', {}).get('orderId')}{pnl_text}"
                         )
                         continue
 
@@ -1408,6 +1587,7 @@ def get_status_text():
         f"Bybit keys loaded: {bybit_keys_ready()}\n"
         f"Auto trading enabled: {AUTO_TRADING_ENABLED}\n"
         f"Extreme alerts enabled: {EXTREME_ALERTS_ENABLED}\n"
+        f"Daily report enabled: {DAILY_REPORT_ENABLED}\n"
         f"Current open positions: {get_open_positions_count()}\n"
         f"Max open positions: {MAX_OPEN_POSITIONS}\n"
         f"Buy RSI <= {RSI_BUY_THRESHOLD:.2f}\n"
@@ -1443,6 +1623,9 @@ def get_diag_text():
     with bybit_symbols_lock:
         bybit_count = len(bybit_linear_symbols)
 
+    with trades_lock:
+        trades_count = len(closed_trades)
+
     return (
         f"🛠 DIAG\n"
         f"ws_keys: {ws_keys}\n"
@@ -1454,6 +1637,7 @@ def get_diag_text():
         f"BYBIT_KEYS_READY: {bybit_keys_ready()}\n"
         f"AUTO_TRADING_ENABLED: {AUTO_TRADING_ENABLED}\n"
         f"EXTREME_ALERTS_ENABLED: {EXTREME_ALERTS_ENABLED}\n"
+        f"DAILY_REPORT_ENABLED: {DAILY_REPORT_ENABLED}\n"
         f"RSI_BUY_THRESHOLD: {RSI_BUY_THRESHOLD}\n"
         f"RSI_SELL_THRESHOLD: {RSI_SELL_THRESHOLD}\n"
         f"EXTREME_RSI_BUY: {EXTREME_RSI_BUY}\n"
@@ -1465,6 +1649,7 @@ def get_diag_text():
         f"MAX_OPEN_POSITIONS: {MAX_OPEN_POSITIONS}\n"
         f"TRADE_SIZE_USDT: {TRADE_SIZE_USDT}\n"
         f"LEVERAGE: {LEVERAGE}\n"
+        f"CLOSED_TRADES_COUNT: {trades_count}\n"
         f"SUPPORTED_BYBIT_USDT_SYMBOLS: {bybit_count}"
     )
 
@@ -1558,14 +1743,39 @@ def telegram_command_loop():
 
                 elif text == "/sell":
                     try:
-                        order = place_bybit_market_sell(BYBIT_SYMBOL)
+                        order, trade = place_bybit_market_sell(BYBIT_SYMBOL, reason="manual_sell")
+                        pnl_text = "" if not trade else f"\nPnL: {trade['pnl_usdt']:.8f} USDT ({trade['pnl_pct']:.2f}%)"
                         send_telegram(
                             f"✅ Bybit MAINNET SELL placed\n"
                             f"Symbol: {BYBIT_SYMBOL}\n"
-                            f"Order ID: {order.get('result', {}).get('orderId')}"
+                            f"Order ID: {order.get('result', {}).get('orderId')}{pnl_text}"
                         )
                     except Exception as e:
                         send_telegram(f"❌ Bybit MAINNET SELL failed\n{e}")
+
+                elif text == "/panicclose":
+                    try:
+                        closed_symbols, errors = panic_close_all_positions()
+                        if not closed_symbols and not errors:
+                            send_telegram("📭 PANIC CLOSE: No open long positions found.")
+                        else:
+                            msg = "🚨 PANIC CLOSE ACTIVATED\n"
+                            if closed_symbols:
+                                msg += "Closed:\n" + "\n".join(closed_symbols[:50])
+                            if errors:
+                                msg += "\n\nErrors:\n" + "\n".join(errors[:20])
+                            send_telegram(msg)
+                    except Exception as e:
+                        send_telegram(f"❌ PANIC CLOSE failed\n{e}")
+
+                elif text == "/pnl":
+                    send_telegram(get_pnl_text())
+
+                elif text == "/dailyreport":
+                    send_telegram(get_pnl_text(day_filter=today_str_from_ts(now_ts())))
+
+                elif text == "/trades":
+                    send_telegram(get_recent_trades_text())
 
                 elif text == "/autoon":
                     AUTO_TRADING_ENABLED = True
@@ -1770,6 +1980,10 @@ def telegram_command_loop():
                         "/bbal - Bybit balances\n"
                         "/buy - manual Bybit market buy for BYBIT_SYMBOL\n"
                         "/sell - manual Bybit market sell for BYBIT_SYMBOL\n"
+                        "/panicclose - close all open long positions now\n"
+                        "/pnl - show all-time PnL summary\n"
+                        "/dailyreport - show today's PnL summary\n"
+                        "/trades - show recent closed trades\n"
                         "/autoon - enable auto trading\n"
                         "/autooff - disable auto trading\n"
                         "/extremeon - enable extreme RSI alerts\n"
@@ -1796,6 +2010,25 @@ def telegram_command_loop():
         except Exception as e:
             print("Telegram command loop error:", e)
             time.sleep(5)
+
+# =========================
+# DAILY REPORT LOOP
+# =========================
+def daily_report_loop():
+    global last_daily_report_date
+
+    while True:
+        try:
+            if DAILY_REPORT_ENABLED and TELEGRAM_ENABLED:
+                now = datetime.now()
+                current_date = now.strftime("%Y-%m-%d")
+                if now.hour == DAILY_REPORT_HOUR and last_daily_report_date != current_date:
+                    send_telegram(get_pnl_text(day_filter=current_date))
+                    last_daily_report_date = current_date
+        except Exception as e:
+            print("Daily report loop error:", e)
+
+        time.sleep(30)
 
 # =========================
 # LOOPS
@@ -1842,6 +2075,37 @@ def scan_loop():
 # =========================
 # MAIN
 # =========================
+def test_bybit_connection():
+    if CATEGORY != "linear":
+        print(f"Warning: current CATEGORY={CATEGORY}, but this bot is intended for linear.")
+
+    if not bybit_keys_ready():
+        print("Bybit keys missing")
+        send_telegram("❌ Bybit mainnet keys missing")
+        return
+
+    try:
+        print("Testing Bybit market data...")
+        ticker = session.get_tickers(category=CATEGORY, symbol=BYBIT_SYMBOL)
+        print("Bybit ticker OK:", ticker)
+
+        print("Testing Bybit wallet balance endpoint...")
+        account = get_bybit_account_wallet()
+        print("Bybit wallet OK:", account)
+
+        refresh_bybit_linear_symbols()
+
+        send_telegram(
+            f"✅ Bybit MAINNET connected\n"
+            f"Category: {CATEGORY}\n"
+            f"Symbol: {BYBIT_SYMBOL}\n"
+            f"Trading enabled: {BYBIT_TRADING_ENABLED}"
+        )
+    except Exception as e:
+        print("Bybit mainnet connection failed:", e)
+        send_telegram(f"❌ Bybit MAINNET connection failed\n{e}")
+
+
 def main():
     print("Starting scanner...")
     print("TELEGRAM_ENABLED =", TELEGRAM_ENABLED)
@@ -1866,6 +2130,9 @@ def main():
     print("DEFAULT_EXTREME_ALERTS_ENABLED =", DEFAULT_EXTREME_ALERTS_ENABLED)
     print("DEFAULT_EXTREME_RSI_BUY =", DEFAULT_EXTREME_RSI_BUY)
     print("DEFAULT_EXTREME_RSI_SELL =", DEFAULT_EXTREME_RSI_SELL)
+    print("TRADES_HISTORY_LIMIT =", TRADES_HISTORY_LIMIT)
+    print("DAILY_REPORT_ENABLED =", DAILY_REPORT_ENABLED)
+    print("DAILY_REPORT_HOUR =", DAILY_REPORT_HOUR)
     print("DEFAULT_MAX_OPEN_POSITIONS =", DEFAULT_MAX_OPEN_POSITIONS)
 
     send_telegram("🚀 Scanner started")
@@ -1878,6 +2145,7 @@ def main():
     threading.Thread(target=telegram_command_loop, daemon=True).start()
     threading.Thread(target=auto_entry_loop, daemon=True).start()
     threading.Thread(target=auto_exit_loop, daemon=True).start()
+    threading.Thread(target=daily_report_loop, daemon=True).start()
 
     scan_loop()
 
