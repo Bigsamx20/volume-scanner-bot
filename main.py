@@ -1,6 +1,5 @@
 import os
 import time
-import math
 import threading
 import requests
 from copy import deepcopy
@@ -54,11 +53,29 @@ RISK_CHECK_INTERVAL_SECONDS = float(os.getenv("RISK_CHECK_INTERVAL_SECONDS", "5"
 AUTO_SCAN_INTERVAL_SECONDS = float(os.getenv("AUTO_SCAN_INTERVAL_SECONDS", "10"))
 
 # =========================
-# EXTREME RSI ALERT DEFAULTS
+# EXTREME SIGNAL DEFAULTS
 # =========================
 DEFAULT_EXTREME_ALERTS_ENABLED = os.getenv("EXTREME_ALERTS_ENABLED", "true").lower() == "true"
-DEFAULT_EXTREME_RSI_BUY = float(os.getenv("EXTREME_RSI_BUY", "10"))
-DEFAULT_EXTREME_RSI_SELL = float(os.getenv("EXTREME_RSI_SELL", "90"))
+
+# Private bot chat:
+# RSI <= 10  -> alert
+# RSI >= 90  -> alert
+PRIVATE_RSI_VERY_LOW = float(os.getenv("PRIVATE_RSI_VERY_LOW", "10"))
+PRIVATE_RSI_VERY_HIGH = float(os.getenv("PRIVATE_RSI_VERY_HIGH", "90"))
+
+# Private + group clean signal:
+# RSI <= 7   -> BUY NOW
+# RSI >= 93  -> SELL NOW (group premium)
+GROUP_SIGNAL_RSI_BUY = float(os.getenv("GROUP_SIGNAL_RSI_BUY", "7"))
+GROUP_SIGNAL_RSI_SELL = float(os.getenv("GROUP_SIGNAL_RSI_SELL", "93"))
+
+# Private extreme raw signal:
+# RSI >= 95 -> EXTREME SELL NOW
+PRIVATE_EXTREME_SELL = float(os.getenv("PRIVATE_EXTREME_SELL", "95"))
+
+# Keep legacy env names for compatibility
+DEFAULT_EXTREME_RSI_BUY = float(os.getenv("EXTREME_RSI_BUY", str(GROUP_SIGNAL_RSI_BUY)))
+DEFAULT_EXTREME_RSI_SELL = float(os.getenv("EXTREME_RSI_SELL", str(PRIVATE_EXTREME_SELL)))
 
 # =========================
 # PNL / REPORTING CONFIG
@@ -151,57 +168,93 @@ EXTREME_ALERTS_ENABLED = DEFAULT_EXTREME_ALERTS_ENABLED
 EXTREME_RSI_BUY = DEFAULT_EXTREME_RSI_BUY
 EXTREME_RSI_SELL = DEFAULT_EXTREME_RSI_SELL
 
-# positions per symbol
 positions = {}
-# cooldown per symbol
 symbol_cooldowns = {}
 
-# closed trades
 closed_trades = []
 last_daily_report_date = None
 
 # =========================
 # TELEGRAM
 # =========================
-def send_telegram(message: str):
-    print("Trying to send Telegram:", message)
+def send_telegram_to_chat(chat_id: str, message: str):
+    print(f"Trying to send Telegram to {chat_id}: {message}")
 
     if not TELEGRAM_ENABLED:
         print("Telegram disabled (TELEGRAM_ENABLED is not true)")
         return
 
-    if not BOT_TOKEN:
-        print("Telegram bot token missing")
+    if not BOT_TOKEN or not chat_id:
+        print("Telegram bot token or chat_id missing")
         return
 
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        response = requests.post(
+            url,
+            json={"chat_id": chat_id, "text": message},
+            timeout=10,
+        )
+        print(f"Telegram status for {chat_id}: {response.status_code}")
+        print(f"Telegram body for {chat_id}: {response.text}")
+        response.raise_for_status()
+    except Exception as e:
+        print(f"Telegram error for {chat_id}: {e}")
+
+
+def send_telegram(message: str):
+    """
+    Shared/system messages to both private chat and group.
+    """
     targets = []
     if CHAT_ID:
         targets.append(CHAT_ID)
     if GROUP_CHAT_ID:
         targets.append(GROUP_CHAT_ID)
 
-    # remove duplicates while keeping order
     seen = set()
-    targets = [x for x in targets if not (x in seen or seen.add(x))]
-
-    if not targets:
-        print("Telegram chat config missing")
-        return
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    targets = [x for x in targets if x and not (x in seen or seen.add(x))]
 
     for target_chat_id in targets:
-        try:
-            response = requests.post(
-                url,
-                json={"chat_id": target_chat_id, "text": message},
-                timeout=10,
-            )
-            print(f"Telegram status for {target_chat_id}:", response.status_code)
-            print(f"Telegram body for {target_chat_id}:", response.text)
-            response.raise_for_status()
-        except Exception as e:
-            print(f"Telegram error for {target_chat_id}:", e)
+        send_telegram_to_chat(target_chat_id, message)
+
+
+def send_private_alert(message: str):
+    """
+    Raw alerts only to private bot chat.
+    """
+    if CHAT_ID:
+        send_telegram_to_chat(CHAT_ID, message)
+
+
+def build_clean_signal_message(side: str, symbol: str, timeframe: str = "5m") -> str:
+    side = side.upper()
+    emoji = "🟢" if side == "BUY" else "🔴"
+    return (
+        f"{emoji} {side} NOW\n"
+        f"Symbol: {symbol}\n"
+        f"Stop Loss: No Stop Loss\n"
+        f"Take Profit: 3% and above\n"
+        f"Timeframe: {timeframe}m\n\n"
+        f"Trading-Style: Scalping"
+    )
+
+
+def send_group_signal(side: str, symbol: str, timeframe: str = "5"):
+    if not GROUP_CHAT_ID:
+        return
+    send_telegram_to_chat(GROUP_CHAT_ID, build_clean_signal_message(side, symbol, timeframe))
+
+
+def send_private_signal(side: str, symbol: str, timeframe: str = "5"):
+    if not CHAT_ID:
+        return
+    send_telegram_to_chat(CHAT_ID, build_clean_signal_message(side, symbol, timeframe))
+
+
+def send_private_and_group_signal(side: str, symbol: str, timeframe: str = "5"):
+    send_private_signal(side, symbol, timeframe)
+    send_group_signal(side, symbol, timeframe)
 
 
 def get_telegram_updates(offset=None, timeout=20):
@@ -384,25 +437,52 @@ def process_extreme_rsi_alerts(symbol: str, tf: str, candle_start: int, rsi_valu
     if not EXTREME_ALERTS_ENABLED:
         return
 
-    if rsi_value >= EXTREME_RSI_SELL:
-        if should_alert_once_per_candle("extreme_rsi_sell", symbol, tf, candle_start):
-            send_telegram(
-                f"🔥 EXTREME SELL NOW\n"
+    # Private-only very low RSI alert
+    if rsi_value <= PRIVATE_RSI_VERY_LOW:
+        if should_alert_once_per_candle("private_rsi_very_low", symbol, tf, candle_start):
+            send_private_alert(
+                f"⚠️ RSI VERY LOW\n"
                 f"Symbol: {symbol}\n"
                 f"Timeframe: {tf}\n"
                 f"RSI: {rsi_value:.2f}\n"
-                f"Extreme threshold: {EXTREME_RSI_SELL:.2f}"
+                f"Threshold: {PRIVATE_RSI_VERY_LOW:.2f}"
             )
 
-    if rsi_value <= EXTREME_RSI_BUY:
-        if should_alert_once_per_candle("extreme_rsi_buy", symbol, tf, candle_start):
-            send_telegram(
+    # Private-only very high RSI alert
+    if rsi_value >= PRIVATE_RSI_VERY_HIGH:
+        if should_alert_once_per_candle("private_rsi_very_high", symbol, tf, candle_start):
+            send_private_alert(
+                f"⚠️ RSI VERY HIGH\n"
+                f"Symbol: {symbol}\n"
+                f"Timeframe: {tf}\n"
+                f"RSI: {rsi_value:.2f}\n"
+                f"Threshold: {PRIVATE_RSI_VERY_HIGH:.2f}"
+            )
+
+    # BUY NOW to private + group only when RSI <= 7
+    if rsi_value <= GROUP_SIGNAL_RSI_BUY:
+        if should_alert_once_per_candle("clean_buy_signal", symbol, tf, candle_start):
+            send_private_alert(
                 f"🔥 EXTREME BUY NOW\n"
                 f"Symbol: {symbol}\n"
                 f"Timeframe: {tf}\n"
                 f"RSI: {rsi_value:.2f}\n"
-                f"Extreme threshold: {EXTREME_RSI_BUY:.2f}"
+                f"Extreme threshold: {GROUP_SIGNAL_RSI_BUY:.2f}"
             )
+            send_private_and_group_signal("BUY", symbol, tf)
+
+    # SELL NOW to private + group when RSI >= 93
+    if rsi_value >= GROUP_SIGNAL_RSI_SELL:
+        if should_alert_once_per_candle("clean_sell_signal", symbol, tf, candle_start):
+            if rsi_value >= PRIVATE_EXTREME_SELL:
+                send_private_alert(
+                    f"🔥 EXTREME SELL NOW\n"
+                    f"Symbol: {symbol}\n"
+                    f"Timeframe: {tf}\n"
+                    f"RSI: {rsi_value:.2f}\n"
+                    f"Extreme threshold: {PRIVATE_EXTREME_SELL:.2f}"
+                )
+            send_private_and_group_signal("SELL", symbol, tf)
 
 # =========================
 # BYBIT HELPERS
@@ -842,8 +922,11 @@ def get_strategy_text():
         f"Buy rule: 5m RSI <= {RSI_BUY_THRESHOLD:.2f}\n"
         f"Sell rule: 5m RSI >= {RSI_SELL_THRESHOLD:.2f} OR SL/TP/Trailing\n"
         f"Extreme alerts enabled: {EXTREME_ALERTS_ENABLED}\n"
-        f"Extreme buy RSI <= {EXTREME_RSI_BUY:.2f}\n"
-        f"Extreme sell RSI >= {EXTREME_RSI_SELL:.2f}\n"
+        f"Private RSI very low <= {PRIVATE_RSI_VERY_LOW:.2f}\n"
+        f"Private RSI very high >= {PRIVATE_RSI_VERY_HIGH:.2f}\n"
+        f"Group signal BUY <= {GROUP_SIGNAL_RSI_BUY:.2f}\n"
+        f"Group signal SELL >= {GROUP_SIGNAL_RSI_SELL:.2f}\n"
+        f"Private extreme SELL >= {PRIVATE_EXTREME_SELL:.2f}\n"
         f"Stop loss: {pct_text(STOP_LOSS_PCT)}\n"
         f"Take profit: {pct_text(TAKE_PROFIT_PCT)}\n"
         f"Trailing stop: {pct_text(TRAILING_STOP_PCT)}\n"
@@ -1087,9 +1170,10 @@ def process_indicators(symbol: str, tf: str, candle_start: int):
             overbought = float(rsi_cfg.get("overbought", 70))
             oversold = float(rsi_cfg.get("oversold", 30))
 
+            # Raw alerts to private chat only
             if r >= overbought:
                 if should_alert_once_per_candle("rsi_overbought", symbol, tf, candle_start):
-                    send_telegram(
+                    send_private_alert(
                         f"🚨 RSI OVERBOUGHT\n"
                         f"Symbol: {symbol}\n"
                         f"Timeframe: {tf}\n"
@@ -1099,7 +1183,7 @@ def process_indicators(symbol: str, tf: str, candle_start: int):
 
             if r <= oversold:
                 if should_alert_once_per_candle("rsi_oversold", symbol, tf, candle_start):
-                    send_telegram(
+                    send_private_alert(
                         f"🚨 RSI OVERSOLD\n"
                         f"Symbol: {symbol}\n"
                         f"Timeframe: {tf}\n"
@@ -1576,7 +1660,7 @@ def auto_exit_loop():
 # TELEGRAM COMMANDS
 # =========================
 def force_test_alerts():
-    send_telegram(
+    send_private_alert(
         "🚨 FORCE TEST ALERT\n"
         "Symbol: BTCUSDT\n"
         "Timeframe: 5\n"
@@ -1609,8 +1693,11 @@ def get_status_text():
         f"Max open positions: {MAX_OPEN_POSITIONS}\n"
         f"Buy RSI <= {RSI_BUY_THRESHOLD:.2f}\n"
         f"Sell RSI >= {RSI_SELL_THRESHOLD:.2f}\n"
-        f"Extreme buy RSI <= {EXTREME_RSI_BUY:.2f}\n"
-        f"Extreme sell RSI >= {EXTREME_RSI_SELL:.2f}\n"
+        f"Private RSI very low <= {PRIVATE_RSI_VERY_LOW:.2f}\n"
+        f"Private RSI very high >= {PRIVATE_RSI_VERY_HIGH:.2f}\n"
+        f"Group BUY <= {GROUP_SIGNAL_RSI_BUY:.2f}\n"
+        f"Group SELL >= {GROUP_SIGNAL_RSI_SELL:.2f}\n"
+        f"Private extreme SELL >= {PRIVATE_EXTREME_SELL:.2f}\n"
         f"SL: {pct_text(STOP_LOSS_PCT)}\n"
         f"TP: {pct_text(TAKE_PROFIT_PCT)}\n"
         f"Trailing: {pct_text(TRAILING_STOP_PCT)}\n"
@@ -1657,8 +1744,11 @@ def get_diag_text():
         f"DAILY_REPORT_ENABLED: {DAILY_REPORT_ENABLED}\n"
         f"RSI_BUY_THRESHOLD: {RSI_BUY_THRESHOLD}\n"
         f"RSI_SELL_THRESHOLD: {RSI_SELL_THRESHOLD}\n"
-        f"EXTREME_RSI_BUY: {EXTREME_RSI_BUY}\n"
-        f"EXTREME_RSI_SELL: {EXTREME_RSI_SELL}\n"
+        f"PRIVATE_RSI_VERY_LOW: {PRIVATE_RSI_VERY_LOW}\n"
+        f"PRIVATE_RSI_VERY_HIGH: {PRIVATE_RSI_VERY_HIGH}\n"
+        f"GROUP_SIGNAL_RSI_BUY: {GROUP_SIGNAL_RSI_BUY}\n"
+        f"GROUP_SIGNAL_RSI_SELL: {GROUP_SIGNAL_RSI_SELL}\n"
+        f"PRIVATE_EXTREME_SELL: {PRIVATE_EXTREME_SELL}\n"
         f"STOP_LOSS_PCT: {STOP_LOSS_PCT}\n"
         f"TAKE_PROFIT_PCT: {TAKE_PROFIT_PCT}\n"
         f"TRAILING_STOP_PCT: {TRAILING_STOP_PCT}\n"
@@ -1677,7 +1767,7 @@ def telegram_command_loop():
     global TRAILING_STOP_PCT, TRAILING_START_PCT
     global RSI_BUY_THRESHOLD, RSI_SELL_THRESHOLD, MAX_OPEN_POSITIONS, SYMBOL_COOLDOWN_SECONDS
     global TRADE_SIZE_USDT, LEVERAGE
-    global EXTREME_ALERTS_ENABLED, EXTREME_RSI_BUY, EXTREME_RSI_SELL
+    global EXTREME_ALERTS_ENABLED
 
     if not TELEGRAM_ENABLED:
         print("Telegram command loop disabled")
@@ -1719,6 +1809,12 @@ def telegram_command_loop():
 
                 elif text == "/force":
                     force_test_alerts()
+
+                elif text == "/forcesignalbuy":
+                    send_private_and_group_signal("BUY", "BTCUSDT", "5")
+
+                elif text == "/forcesignalsell":
+                    send_private_and_group_signal("SELL", "BTCUSDT", "5")
 
                 elif text == "/status":
                     send_telegram(get_status_text())
@@ -1807,11 +1903,7 @@ def telegram_command_loop():
 
                 elif text == "/extremeon":
                     EXTREME_ALERTS_ENABLED = True
-                    send_telegram(
-                        f"✅ Extreme RSI alerts enabled\n"
-                        f"Extreme buy RSI <= {EXTREME_RSI_BUY:.2f}\n"
-                        f"Extreme sell RSI >= {EXTREME_RSI_SELL:.2f}"
-                    )
+                    send_telegram("✅ Extreme RSI alerts enabled")
 
                 elif text == "/extremeoff":
                     EXTREME_ALERTS_ENABLED = False
@@ -1838,36 +1930,6 @@ def telegram_command_loop():
                         send_telegram(f"✅ Sell RSI threshold updated to {RSI_SELL_THRESHOLD:.2f}")
                     except Exception as e:
                         send_telegram(f"❌ Failed to set sell RSI threshold\n{e}")
-
-                elif text.startswith("/setextremebuy "):
-                    try:
-                        value = float(text.split(maxsplit=1)[1].strip())
-                        if value < 0 or value > 100:
-                            raise Exception("Extreme buy RSI must be between 0 and 100")
-                        EXTREME_RSI_BUY = value
-                        send_telegram(
-                            f"✅ Extreme BUY RSI updated\n"
-                            f"Extreme alerts enabled: {EXTREME_ALERTS_ENABLED}\n"
-                            f"Extreme buy RSI <= {EXTREME_RSI_BUY:.2f}\n"
-                            f"Extreme sell RSI >= {EXTREME_RSI_SELL:.2f}"
-                        )
-                    except Exception as e:
-                        send_telegram(f"❌ Failed to set extreme buy RSI\n{e}")
-
-                elif text.startswith("/setextremesell "):
-                    try:
-                        value = float(text.split(maxsplit=1)[1].strip())
-                        if value < 0 or value > 100:
-                            raise Exception("Extreme sell RSI must be between 0 and 100")
-                        EXTREME_RSI_SELL = value
-                        send_telegram(
-                            f"✅ Extreme SELL RSI updated\n"
-                            f"Extreme alerts enabled: {EXTREME_ALERTS_ENABLED}\n"
-                            f"Extreme buy RSI <= {EXTREME_RSI_BUY:.2f}\n"
-                            f"Extreme sell RSI >= {EXTREME_RSI_SELL:.2f}"
-                        )
-                    except Exception as e:
-                        send_telegram(f"❌ Failed to set extreme sell RSI\n{e}")
 
                 elif text.startswith("/setsl "):
                     try:
@@ -1992,7 +2054,9 @@ def telegram_command_loop():
                     send_telegram(
                         "Available commands:\n"
                         "/test - Telegram test\n"
-                        "/force - force fake alerts\n"
+                        "/force - force fake raw alert to private chat\n"
+                        "/forcesignalbuy - force clean BUY signal to private + group\n"
+                        "/forcesignalsell - force clean SELL signal to private + group\n"
                         "/status - bot status\n"
                         "/symbols - live symbol sample\n"
                         "/diag - websocket diagnostics\n"
@@ -2012,8 +2076,6 @@ def telegram_command_loop():
                         "/showpositions - show tracked positions\n"
                         "/setrsibuy 15 - set buy threshold\n"
                         "/setrsisell 85 - set sell threshold\n"
-                        "/setextremebuy 10 - set extreme buy RSI threshold\n"
-                        "/setextremesell 90 - set extreme sell RSI threshold\n"
                         "/setsl 0 - set stop loss percent (0 = OFF)\n"
                         "/settp 3 - set take profit percent (0 = OFF)\n"
                         "/settrailing 2 - set trailing stop percent (0 = OFF)\n"
@@ -2149,8 +2211,11 @@ def main():
     print("DEFAULT_RSI_BUY =", DEFAULT_RSI_BUY)
     print("DEFAULT_RSI_SELL =", DEFAULT_RSI_SELL)
     print("DEFAULT_EXTREME_ALERTS_ENABLED =", DEFAULT_EXTREME_ALERTS_ENABLED)
-    print("DEFAULT_EXTREME_RSI_BUY =", DEFAULT_EXTREME_RSI_BUY)
-    print("DEFAULT_EXTREME_RSI_SELL =", DEFAULT_EXTREME_RSI_SELL)
+    print("PRIVATE_RSI_VERY_LOW =", PRIVATE_RSI_VERY_LOW)
+    print("PRIVATE_RSI_VERY_HIGH =", PRIVATE_RSI_VERY_HIGH)
+    print("GROUP_SIGNAL_RSI_BUY =", GROUP_SIGNAL_RSI_BUY)
+    print("GROUP_SIGNAL_RSI_SELL =", GROUP_SIGNAL_RSI_SELL)
+    print("PRIVATE_EXTREME_SELL =", PRIVATE_EXTREME_SELL)
     print("TRADES_HISTORY_LIMIT =", TRADES_HISTORY_LIMIT)
     print("DAILY_REPORT_ENABLED =", DAILY_REPORT_ENABLED)
     print("DAILY_REPORT_HOUR =", DAILY_REPORT_HOUR)
