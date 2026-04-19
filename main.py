@@ -170,22 +170,38 @@ def send_telegram(message: str):
         print("Telegram disabled (TELEGRAM_ENABLED is not true)")
         return
 
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Telegram config missing")
+    if not BOT_TOKEN:
+        print("Telegram bot token missing")
         return
 
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        response = requests.post(
-            url,
-            json={"chat_id": CHAT_ID, "text": message},
-            timeout=10,
-        )
-        print("Telegram status:", response.status_code)
-        print("Telegram body:", response.text)
-        response.raise_for_status()
-    except Exception as e:
-        print("Telegram error:", e)
+    targets = []
+    if CHAT_ID:
+        targets.append(CHAT_ID)
+    if GROUP_CHAT_ID:
+        targets.append(GROUP_CHAT_ID)
+
+    # remove duplicates while keeping order
+    seen = set()
+    targets = [x for x in targets if not (x in seen or seen.add(x))]
+
+    if not targets:
+        print("Telegram chat config missing")
+        return
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+    for target_chat_id in targets:
+        try:
+            response = requests.post(
+                url,
+                json={"chat_id": target_chat_id, "text": message},
+                timeout=10,
+            )
+            print(f"Telegram status for {target_chat_id}:", response.status_code)
+            print(f"Telegram body for {target_chat_id}:", response.text)
+            response.raise_for_status()
+        except Exception as e:
+            print(f"Telegram error for {target_chat_id}:", e)
 
 
 def get_telegram_updates(offset=None, timeout=20):
@@ -1684,7 +1700,10 @@ def telegram_command_loop():
                 if not text:
                     continue
 
-                if CHAT_ID and from_chat_id != str(CHAT_ID):
+                allowed_chat_ids = {str(CHAT_ID).strip(), str(GROUP_CHAT_ID).strip()}
+                allowed_chat_ids = {x for x in allowed_chat_ids if x}
+
+                if allowed_chat_ids and from_chat_id not in allowed_chat_ids:
                     print(f"Ignoring command from unauthorized chat: {from_chat_id}")
                     continue
 
@@ -2112,6 +2131,7 @@ def main():
     print("TELEGRAM_ENABLED =", TELEGRAM_ENABLED)
     print("BOT_TOKEN set =", bool(BOT_TOKEN))
     print("CHAT_ID set =", bool(CHAT_ID))
+    print("GROUP_CHAT_ID set =", bool(GROUP_CHAT_ID))
     print("CATEGORY =", CATEGORY)
     print("TOP_N =", TOP_N)
     print("LIVE_WS_SYMBOLS =", LIVE_WS_SYMBOLS)
@@ -2153,4 +2173,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
