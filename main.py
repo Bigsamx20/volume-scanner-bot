@@ -54,6 +54,13 @@ RISK_CHECK_INTERVAL_SECONDS = float(os.getenv("RISK_CHECK_INTERVAL_SECONDS", "5"
 AUTO_SCAN_INTERVAL_SECONDS = float(os.getenv("AUTO_SCAN_INTERVAL_SECONDS", "10"))
 
 # =========================
+# EXTREME RSI ALERT DEFAULTS
+# =========================
+DEFAULT_EXTREME_ALERTS_ENABLED = os.getenv("EXTREME_ALERTS_ENABLED", "true").lower() == "true"
+DEFAULT_EXTREME_RSI_BUY = float(os.getenv("EXTREME_RSI_BUY", "10"))
+DEFAULT_EXTREME_RSI_SELL = float(os.getenv("EXTREME_RSI_SELL", "90"))
+
+# =========================
 # DEFAULT SETTINGS
 # =========================
 TIMEFRAME_DEFAULTS = {
@@ -131,6 +138,10 @@ SYMBOL_COOLDOWN_SECONDS = DEFAULT_SYMBOL_COOLDOWN_SECONDS
 
 TRADE_SIZE_USDT = BYBIT_TRADE_SIZE_USDT
 LEVERAGE = BYBIT_LEVERAGE
+
+EXTREME_ALERTS_ENABLED = DEFAULT_EXTREME_ALERTS_ENABLED
+EXTREME_RSI_BUY = DEFAULT_EXTREME_RSI_BUY
+EXTREME_RSI_SELL = DEFAULT_EXTREME_RSI_SELL
 
 # positions per symbol
 positions = {}
@@ -300,7 +311,6 @@ def fmt_qty_or_price(value) -> str:
         s = s.rstrip("0").rstrip(".")
     return s
 
-
 # =========================
 # INDICATORS
 # =========================
@@ -328,6 +338,31 @@ def rsi(values, length=14):
 
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
+
+
+def process_extreme_rsi_alerts(symbol: str, tf: str, candle_start: int, rsi_value: float):
+    if not EXTREME_ALERTS_ENABLED:
+        return
+
+    if rsi_value >= EXTREME_RSI_SELL:
+        if should_alert_once_per_candle("extreme_rsi_sell", symbol, tf, candle_start):
+            send_telegram(
+                f"🔥 EXTREME SELL NOW\n"
+                f"Symbol: {symbol}\n"
+                f"Timeframe: {tf}\n"
+                f"RSI: {rsi_value:.2f}\n"
+                f"Extreme threshold: {EXTREME_RSI_SELL:.2f}"
+            )
+
+    if rsi_value <= EXTREME_RSI_BUY:
+        if should_alert_once_per_candle("extreme_rsi_buy", symbol, tf, candle_start):
+            send_telegram(
+                f"🔥 EXTREME BUY NOW\n"
+                f"Symbol: {symbol}\n"
+                f"Timeframe: {tf}\n"
+                f"RSI: {rsi_value:.2f}\n"
+                f"Extreme threshold: {EXTREME_RSI_BUY:.2f}"
+            )
 
 # =========================
 # BYBIT HELPERS
@@ -496,7 +531,6 @@ def compute_bybit_order_qty(symbol: str, last_price: float):
     min_notional_value = safe_float(lot.get("minNotionalValue"), 0.0)
     max_mkt_order_qty = safe_float(lot.get("maxMktOrderQty"), 0.0)
 
-    # Effective position notional
     notional_usdt = TRADE_SIZE_USDT * LEVERAGE
     raw_qty = notional_usdt / last_price
     qty_str = fmt_qty_or_price(floor_to_step_str(raw_qty, qty_step))
@@ -558,9 +592,8 @@ def ensure_bybit_leverage(symbol: str):
     except Exception as e:
         msg = str(e).lower()
 
-        # Harmless cases: already set or current mode/state prevents a no-op change.
         harmless_tokens = [
-            "110043",   # leverage not modified
+            "110043",
             "not modified",
             "same to the existing leverage",
         ]
@@ -816,6 +849,9 @@ def get_strategy_text():
         f"Exchange trading: Bybit MAINNET ({CATEGORY})\n"
         f"Buy rule: 5m RSI <= {RSI_BUY_THRESHOLD:.2f}\n"
         f"Sell rule: 5m RSI >= {RSI_SELL_THRESHOLD:.2f} OR SL/TP/Trailing\n"
+        f"Extreme alerts enabled: {EXTREME_ALERTS_ENABLED}\n"
+        f"Extreme buy RSI <= {EXTREME_RSI_BUY:.2f}\n"
+        f"Extreme sell RSI >= {EXTREME_RSI_SELL:.2f}\n"
         f"Stop loss: {pct_text(STOP_LOSS_PCT)}\n"
         f"Take profit: {pct_text(TAKE_PROFIT_PCT)}\n"
         f"Trailing stop: {pct_text(TRAILING_STOP_PCT)}\n"
@@ -998,6 +1034,8 @@ def process_indicators(symbol: str, tf: str, candle_start: int):
                         f"RSI: {r:.2f}\n"
                         f"Threshold: {oversold}"
                     )
+
+            process_extreme_rsi_alerts(symbol, tf, candle_start, r)
 
 # =========================
 # LIVE KLINE HANDLER
@@ -1186,7 +1224,6 @@ def auto_entry_loop():
                 if not is_symbol_supported_on_bybit(symbol):
                     continue
 
-                # avoid duplicate if exchange already has open long
                 exchange_pos = get_bybit_position(symbol)
                 if exchange_pos and str(exchange_pos.get("side", "")).strip() == "Buy":
                     continue
@@ -1370,10 +1407,13 @@ def get_status_text():
         f"Bybit trading enabled: {BYBIT_TRADING_ENABLED}\n"
         f"Bybit keys loaded: {bybit_keys_ready()}\n"
         f"Auto trading enabled: {AUTO_TRADING_ENABLED}\n"
+        f"Extreme alerts enabled: {EXTREME_ALERTS_ENABLED}\n"
         f"Current open positions: {get_open_positions_count()}\n"
         f"Max open positions: {MAX_OPEN_POSITIONS}\n"
         f"Buy RSI <= {RSI_BUY_THRESHOLD:.2f}\n"
         f"Sell RSI >= {RSI_SELL_THRESHOLD:.2f}\n"
+        f"Extreme buy RSI <= {EXTREME_RSI_BUY:.2f}\n"
+        f"Extreme sell RSI >= {EXTREME_RSI_SELL:.2f}\n"
         f"SL: {pct_text(STOP_LOSS_PCT)}\n"
         f"TP: {pct_text(TAKE_PROFIT_PCT)}\n"
         f"Trailing: {pct_text(TRAILING_STOP_PCT)}\n"
@@ -1413,8 +1453,11 @@ def get_diag_text():
         f"BYBIT_TRADING_ENABLED: {BYBIT_TRADING_ENABLED}\n"
         f"BYBIT_KEYS_READY: {bybit_keys_ready()}\n"
         f"AUTO_TRADING_ENABLED: {AUTO_TRADING_ENABLED}\n"
+        f"EXTREME_ALERTS_ENABLED: {EXTREME_ALERTS_ENABLED}\n"
         f"RSI_BUY_THRESHOLD: {RSI_BUY_THRESHOLD}\n"
         f"RSI_SELL_THRESHOLD: {RSI_SELL_THRESHOLD}\n"
+        f"EXTREME_RSI_BUY: {EXTREME_RSI_BUY}\n"
+        f"EXTREME_RSI_SELL: {EXTREME_RSI_SELL}\n"
         f"STOP_LOSS_PCT: {STOP_LOSS_PCT}\n"
         f"TAKE_PROFIT_PCT: {TAKE_PROFIT_PCT}\n"
         f"TRAILING_STOP_PCT: {TRAILING_STOP_PCT}\n"
@@ -1432,6 +1475,7 @@ def telegram_command_loop():
     global TRAILING_STOP_PCT, TRAILING_START_PCT
     global RSI_BUY_THRESHOLD, RSI_SELL_THRESHOLD, MAX_OPEN_POSITIONS, SYMBOL_COOLDOWN_SECONDS
     global TRADE_SIZE_USDT, LEVERAGE
+    global EXTREME_ALERTS_ENABLED, EXTREME_RSI_BUY, EXTREME_RSI_SELL
 
     if not TELEGRAM_ENABLED:
         print("Telegram command loop disabled")
@@ -1531,6 +1575,18 @@ def telegram_command_loop():
                     AUTO_TRADING_ENABLED = False
                     send_telegram("⏸ Auto trading disabled")
 
+                elif text == "/extremeon":
+                    EXTREME_ALERTS_ENABLED = True
+                    send_telegram(
+                        f"✅ Extreme RSI alerts enabled\n"
+                        f"Extreme buy RSI <= {EXTREME_RSI_BUY:.2f}\n"
+                        f"Extreme sell RSI >= {EXTREME_RSI_SELL:.2f}"
+                    )
+
+                elif text == "/extremeoff":
+                    EXTREME_ALERTS_ENABLED = False
+                    send_telegram("⏸ Extreme RSI alerts disabled")
+
                 elif text == "/showstrategy":
                     send_telegram(get_strategy_text())
 
@@ -1552,6 +1608,36 @@ def telegram_command_loop():
                         send_telegram(f"✅ Sell RSI threshold updated to {RSI_SELL_THRESHOLD:.2f}")
                     except Exception as e:
                         send_telegram(f"❌ Failed to set sell RSI threshold\n{e}")
+
+                elif text.startswith("/setextremebuy "):
+                    try:
+                        value = float(text.split(maxsplit=1)[1].strip())
+                        if value < 0 or value > 100:
+                            raise Exception("Extreme buy RSI must be between 0 and 100")
+                        EXTREME_RSI_BUY = value
+                        send_telegram(
+                            f"✅ Extreme BUY RSI updated\n"
+                            f"Extreme alerts enabled: {EXTREME_ALERTS_ENABLED}\n"
+                            f"Extreme buy RSI <= {EXTREME_RSI_BUY:.2f}\n"
+                            f"Extreme sell RSI >= {EXTREME_RSI_SELL:.2f}"
+                        )
+                    except Exception as e:
+                        send_telegram(f"❌ Failed to set extreme buy RSI\n{e}")
+
+                elif text.startswith("/setextremesell "):
+                    try:
+                        value = float(text.split(maxsplit=1)[1].strip())
+                        if value < 0 or value > 100:
+                            raise Exception("Extreme sell RSI must be between 0 and 100")
+                        EXTREME_RSI_SELL = value
+                        send_telegram(
+                            f"✅ Extreme SELL RSI updated\n"
+                            f"Extreme alerts enabled: {EXTREME_ALERTS_ENABLED}\n"
+                            f"Extreme buy RSI <= {EXTREME_RSI_BUY:.2f}\n"
+                            f"Extreme sell RSI >= {EXTREME_RSI_SELL:.2f}"
+                        )
+                    except Exception as e:
+                        send_telegram(f"❌ Failed to set extreme sell RSI\n{e}")
 
                 elif text.startswith("/setsl "):
                     try:
@@ -1686,10 +1772,14 @@ def telegram_command_loop():
                         "/sell - manual Bybit market sell for BYBIT_SYMBOL\n"
                         "/autoon - enable auto trading\n"
                         "/autooff - disable auto trading\n"
+                        "/extremeon - enable extreme RSI alerts\n"
+                        "/extremeoff - disable extreme RSI alerts\n"
                         "/showstrategy - show auto strategy\n"
                         "/showpositions - show tracked positions\n"
                         "/setrsibuy 15 - set buy threshold\n"
                         "/setrsisell 85 - set sell threshold\n"
+                        "/setextremebuy 10 - set extreme buy RSI threshold\n"
+                        "/setextremesell 90 - set extreme sell RSI threshold\n"
                         "/setsl 0 - set stop loss percent (0 = OFF)\n"
                         "/settp 3 - set take profit percent (0 = OFF)\n"
                         "/settrailing 2 - set trailing stop percent (0 = OFF)\n"
@@ -1773,6 +1863,9 @@ def main():
     print("DEFAULT_TRAILING_START_PCT =", DEFAULT_TRAILING_START_PCT)
     print("DEFAULT_RSI_BUY =", DEFAULT_RSI_BUY)
     print("DEFAULT_RSI_SELL =", DEFAULT_RSI_SELL)
+    print("DEFAULT_EXTREME_ALERTS_ENABLED =", DEFAULT_EXTREME_ALERTS_ENABLED)
+    print("DEFAULT_EXTREME_RSI_BUY =", DEFAULT_EXTREME_RSI_BUY)
+    print("DEFAULT_EXTREME_RSI_SELL =", DEFAULT_EXTREME_RSI_SELL)
     print("DEFAULT_MAX_OPEN_POSITIONS =", DEFAULT_MAX_OPEN_POSITIONS)
 
     send_telegram("🚀 Scanner started")
