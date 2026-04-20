@@ -1,8 +1,8 @@
 import os
 import time
-import math
 import threading
 import requests
+import queue
 from copy import deepcopy
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from datetime import datetime
@@ -13,20 +13,23 @@ from pybit.unified_trading import HTTP, WebSocket
 # =========================
 TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-GROUP_CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID", "").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()               # private bot chat
+GROUP_CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID", "").strip()   # telegram group
 
 CATEGORY = os.getenv("BYBIT_CATEGORY", "linear").strip().lower()
-TOP_N = int(os.getenv("TOP_N", "500"))
-LIVE_WS_SYMBOLS = int(os.getenv("LIVE_WS_SYMBOLS", "80"))
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "300"))
-HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "300"))
-SHORTLIST_REFRESH_SECONDS = int(os.getenv("SHORTLIST_REFRESH_SECONDS", "300"))
-REQUEST_SLEEP_SECONDS = float(os.getenv("REQUEST_SLEEP_SECONDS", "0.12"))
-HEARTBEAT_TO_TELEGRAM = os.getenv("HEARTBEAT_TO_TELEGRAM", "true").lower() == "true"
-WS_DEBUG = os.getenv("WS_DEBUG", "true").lower() == "true"
 
-TIMEFRAMES = ["5", "60"]
+# faster scalping-oriented defaults
+TOP_N = int(os.getenv("TOP_N", "150"))
+LIVE_WS_SYMBOLS = int(os.getenv("LIVE_WS_SYMBOLS", "150"))
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "120"))
+HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "300"))
+SHORTLIST_REFRESH_SECONDS = int(os.getenv("SHORTLIST_REFRESH_SECONDS", "30"))
+REQUEST_SLEEP_SECONDS = float(os.getenv("REQUEST_SLEEP_SECONDS", "0.01"))
+HEARTBEAT_TO_TELEGRAM = os.getenv("HEARTBEAT_TO_TELEGRAM", "true").lower() == "true"
+WS_DEBUG = os.getenv("WS_DEBUG", "false").lower() == "true"
+
+# 5m only for speed
+TIMEFRAMES = ["5"]
 
 # =========================
 # BYBIT MAINNET CONFIG
@@ -56,6 +59,8 @@ AUTO_SCAN_INTERVAL_SECONDS = float(os.getenv("AUTO_SCAN_INTERVAL_SECONDS", "10")
 # =========================
 # RSI ALERT TIERS
 # =========================
+# Private bot gets all 3 alerts
+# Group gets only Alert 3
 ALERT1_RSI_BUY = float(os.getenv("ALERT1_RSI_BUY", "10"))
 ALERT1_RSI_SELL = float(os.getenv("ALERT1_RSI_SELL", "85"))
 
@@ -77,12 +82,6 @@ DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "21"))
 # =========================
 TIMEFRAME_DEFAULTS = {
     "5": {
-        "rsi": {
-            "enabled": True,
-            "length": 14,
-        },
-    },
-    "60": {
         "rsi": {
             "enabled": True,
             "length": 14,
@@ -132,6 +131,9 @@ last_shortlist_refresh_at = 0
 
 bybit_linear_symbols = set()
 
+# telegram queue so detection is not blocked by HTTP sending
+telegram_queue = queue.Queue(maxsize=5000)
+
 # =========================
 # LIVE AUTO SETTINGS
 # =========================
@@ -160,50 +162,64 @@ last_daily_report_date = None
 # =========================
 # TELEGRAM
 # =========================
-def send_telegram_message(chat_id: str, message: str):
-    print(f"Trying to send Telegram to {chat_id}: {message}")
-
+def _send_telegram_http(chat_id: str, message: str):
     if not TELEGRAM_ENABLED:
-        print("Telegram disabled (TELEGRAM_ENABLED is not true)")
         return
-
     if not BOT_TOKEN:
-        print("Telegram bot token missing")
         return
-
     if not chat_id:
-        print("Telegram chat_id missing")
         return
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    response = requests.post(
+        url,
+        json={"chat_id": chat_id, "text": message},
+        timeout=10,
+    )
+    response.raise_for_status()
+
+
+def enqueue_telegram(chat_id: str, message: str):
+    if not TELEGRAM_ENABLED:
+        return
+    if not chat_id:
+        return
 
     try:
-        response = requests.post(
-            url,
-            json={"chat_id": chat_id, "text": message},
-            timeout=10,
-        )
-        print(f"Telegram status for {chat_id}:", response.status_code)
-        print(f"Telegram body for {chat_id}:", response.text)
-        response.raise_for_status()
-    except Exception as e:
-        print(f"Telegram error for {chat_id}:", e)
+        telegram_queue.put_nowait((chat_id, message))
+    except queue.Full:
+        print(f"Telegram queue full. Dropping message for {chat_id}")
 
 
 def send_telegram(message: str):
-    # Private bot/user chat only
-    send_telegram_message(CHAT_ID, message)
+    # private bot only
+    enqueue_telegram(CHAT_ID, message)
 
 
 def send_telegram_group(message: str):
-    # Telegram group only
-    send_telegram_message(GROUP_CHAT_ID, message)
+    # group only
+    enqueue_telegram(GROUP_CHAT_ID, message)
 
 
 def send_alert3_to_all(message: str):
-    # Alert 3 goes to both private bot chat and group
+    # alert 3 goes to bot + group
     send_telegram(message)
     send_telegram_group(message)
+
+
+def telegram_sender_loop():
+    while True:
+        try:
+            chat_id, message = telegram_queue.get()
+            try:
+                _send_telegram_http(chat_id, message)
+            except Exception as e:
+                print(f"Telegram send error for {chat_id}: {e}")
+            finally:
+                telegram_queue.task_done()
+        except Exception as e:
+            print("telegram_sender_loop error:", e)
+            time.sleep(1)
 
 
 def get_telegram_updates(offset=None, timeout=20):
@@ -383,7 +399,7 @@ def rsi(values, length=14):
 
 
 def process_rsi_tier_alerts(symbol: str, tf: str, candle_start: int, rsi_value: float):
-    # Alert 1 -> bot only
+    # Alert 1 -> private bot only
     if rsi_value >= ALERT1_RSI_SELL:
         if should_alert_once_per_candle("alert1_rsi_sell", symbol, tf, candle_start):
             send_telegram(
@@ -404,7 +420,7 @@ def process_rsi_tier_alerts(symbol: str, tf: str, candle_start: int, rsi_value: 
                 f"Threshold: {ALERT1_RSI_BUY:.2f}"
             )
 
-    # Alert 2 -> bot only
+    # Alert 2 -> private bot only
     if rsi_value >= ALERT2_RSI_SELL:
         if should_alert_once_per_candle("alert2_rsi_sell", symbol, tf, candle_start):
             send_telegram(
@@ -425,28 +441,28 @@ def process_rsi_tier_alerts(symbol: str, tf: str, candle_start: int, rsi_value: 
                 f"Threshold: {ALERT2_RSI_BUY:.2f}"
             )
 
-    # Alert 3 -> bot + group
+    # Alert 3 -> private bot + group
     if rsi_value >= ALERT3_RSI_SELL:
         if should_alert_once_per_candle("alert3_rsi_sell", symbol, tf, candle_start):
-            message = (
+            msg = (
                 f"🚨 ALERT 3 - RSI SELL NOW\n"
                 f"Symbol: {symbol}\n"
                 f"Timeframe: {tf}\n"
                 f"RSI: {rsi_value:.2f}\n"
                 f"Threshold: {ALERT3_RSI_SELL:.2f}"
             )
-            send_alert3_to_all(message)
+            send_alert3_to_all(msg)
 
     if rsi_value <= ALERT3_RSI_BUY:
         if should_alert_once_per_candle("alert3_rsi_buy", symbol, tf, candle_start):
-            message = (
+            msg = (
                 f"🚨 ALERT 3 - RSI BUY NOW\n"
                 f"Symbol: {symbol}\n"
                 f"Timeframe: {tf}\n"
                 f"RSI: {rsi_value:.2f}\n"
                 f"Threshold: {ALERT3_RSI_BUY:.2f}"
             )
-            send_alert3_to_all(message)
+            send_alert3_to_all(msg)
 
 # =========================
 # BYBIT HELPERS
@@ -883,6 +899,8 @@ def get_strategy_text():
         f"🤖 Auto strategy\n"
         f"Auto trading: {AUTO_TRADING_ENABLED}\n"
         f"Exchange trading: Bybit MAINNET ({CATEGORY})\n"
+        f"Timeframes: {', '.join(TIMEFRAMES)}\n"
+        f"Live symbols watched: {LIVE_WS_SYMBOLS}\n"
         f"Buy rule: 5m RSI <= {RSI_BUY_THRESHOLD:.2f}\n"
         f"Sell rule: 5m RSI >= {RSI_SELL_THRESHOLD:.2f} OR SL/TP/Trailing\n"
         f"RSI Alert 1: buy <= {ALERT1_RSI_BUY:.2f} | sell >= {ALERT1_RSI_SELL:.2f} (bot only)\n"
@@ -1019,8 +1037,7 @@ def build_shortlist_from_tickers():
 
 
 def pick_live_symbols(symbols):
-    selected = list(symbols[:LIVE_WS_SYMBOLS])
-    return selected
+    return list(symbols[:LIVE_WS_SYMBOLS])
 
 # =========================
 # HISTORY
@@ -1054,7 +1071,6 @@ def fetch_history(symbol: str, tf: str):
 
         if closes:
             data[symbol][tf] = closes
-            print(f"Loaded history: {symbol} {tf} candles={len(closes)}")
 
     except Exception as e:
         print(f"History fetch error {symbol} {tf}: {e}")
@@ -1065,26 +1081,37 @@ def refresh_shortlist_and_history():
 
     print("Refreshing shortlist...")
     symbols = build_shortlist_from_tickers()
-    print(f"Shortlist size: {len(symbols)}")
-
     selected_live_symbols = pick_live_symbols(symbols)
-    print(f"Live WS symbols: {len(selected_live_symbols)}")
 
     new_shortlist = set(symbols)
     new_live_symbols = set(selected_live_symbols)
 
-    for symbol in selected_live_symbols:
+    # only fetch history for newly-added live symbols to reduce refresh cost
+    with shortlist_lock:
+        old_live = set(live_symbols)
+
+    added_symbols = sorted(list(new_live_symbols - old_live))
+
+    for symbol in added_symbols:
         ensure_symbol_state(symbol)
         for tf in TIMEFRAMES:
             fetch_history(symbol, tf)
-            time.sleep(REQUEST_SLEEP_SECONDS)
+            if REQUEST_SLEEP_SECONDS > 0:
+                time.sleep(REQUEST_SLEEP_SECONDS)
+
+    # safety: if some symbol has no data yet, fetch it
+    for symbol in selected_live_symbols:
+        ensure_symbol_state(symbol)
+        for tf in TIMEFRAMES:
+            if len(data[symbol][tf]) < 20:
+                fetch_history(symbol, tf)
 
     with shortlist_lock:
         shortlist = new_shortlist
         live_symbols = new_live_symbols
 
     last_shortlist_refresh_at = int(time.time())
-    print("Shortlist and history refreshed")
+    print(f"Shortlist refreshed. shortlist={len(new_shortlist)} live={len(new_live_symbols)}")
 
 # =========================
 # RANKING
@@ -1126,7 +1153,6 @@ def process_indicators(symbol: str, tf: str, candle_start: int):
     if rsi_cfg.get("enabled", False):
         rsi_length = int(rsi_cfg.get("length", 14))
         r = rsi(arr, rsi_length)
-
         if r is not None:
             process_rsi_tier_alerts(symbol, tf, candle_start, r)
 
@@ -1191,7 +1217,6 @@ def handle_kline(msg):
             if new_candle_started:
                 current_candle_start[symbol][interval] = start_time
                 arr.append(close)
-
                 if len(arr) > HISTORY_LIMIT:
                     arr.pop(0)
             else:
@@ -1249,8 +1274,8 @@ def start_websocket_for_timeframe(tf: str):
                 symbol=symbol,
                 callback=callback
             )
-            print(f"Subscribed live: {symbol} {tf} ({i}/{len(symbols)})")
-            time.sleep(0.03)
+            if REQUEST_SLEEP_SECONDS > 0:
+                time.sleep(min(REQUEST_SLEEP_SECONDS, 0.02))
         except Exception as e:
             print(f"Subscription error {symbol} {tf}: {e}")
 
@@ -1484,7 +1509,7 @@ def auto_entry_loop():
                             )
 
                     send_telegram(msg)
-                    time.sleep(1.0)
+                    time.sleep(0.5)
                 except Exception as e:
                     print(f"Auto buy failed for {symbol}: {e}")
 
@@ -1522,13 +1547,6 @@ def auto_exit_loop():
                         qty = refreshed["quantity"]
 
                     current_rsi = get_symbol_rsi(symbol, "5", 14)
-
-                    print(
-                        f"AUTO EXIT CHECK -> {symbol} current={current_price} "
-                        f"entry={entry_price} sl={stop_loss_price} tp={take_profit_price} "
-                        f"high={highest_price} trailing_active={trailing_active} "
-                        f"tsl={trailing_stop_price} rsi={current_rsi}"
-                    )
 
                     if stop_loss_price is not None and current_price <= stop_loss_price:
                         order, trade = place_bybit_market_sell(symbol, reason="stop_loss")
@@ -1665,7 +1683,7 @@ def get_symbols_text():
     with shortlist_lock:
         syms = sorted(list(live_symbols))
 
-    preview = syms[:40]
+    preview = syms[:60]
     return f"📊 Live symbol count: {len(syms)}\nSample:\n" + "\n".join(preview)
 
 
@@ -1710,7 +1728,8 @@ def get_diag_text():
         f"TRADE_SIZE_USDT: {TRADE_SIZE_USDT}\n"
         f"LEVERAGE: {LEVERAGE}\n"
         f"CLOSED_TRADES_COUNT: {trades_count}\n"
-        f"SUPPORTED_BYBIT_USDT_SYMBOLS: {bybit_count}"
+        f"SUPPORTED_BYBIT_USDT_SYMBOLS: {bybit_count}\n"
+        f"TELEGRAM_QUEUE_SIZE: {telegram_queue.qsize()}"
     )
 
 
@@ -2050,10 +2069,19 @@ def daily_report_loop():
 # LOOPS
 # =========================
 def shortlist_refresh_loop():
+    last_live_snapshot = set()
+
     while True:
         try:
             refresh_shortlist_and_history()
-            restart_websockets()
+
+            with shortlist_lock:
+                current_live = set(live_symbols)
+
+            if current_live != last_live_snapshot:
+                restart_websockets()
+                last_live_snapshot = set(current_live)
+
             refresh_bybit_linear_symbols()
         except Exception as e:
             print("Shortlist refresh error:", e)
@@ -2073,16 +2101,13 @@ def scan_loop():
                 if first_run:
                     print("Waiting for live symbols to finish loading...")
                     first_run = False
-                time.sleep(5)
+                time.sleep(3)
                 continue
 
             top_5m = get_top_gainers_from_history("5", min(LIVE_WS_SYMBOLS, 20))
-            top_1h = get_top_gainers_from_history("60", min(LIVE_WS_SYMBOLS, 20))
-
             print("Top 5m gainers:", top_5m[:10])
-            print("Top 1h gainers:", top_1h[:10])
 
-            time.sleep(30)
+            time.sleep(20)
 
         except Exception as e:
             print("Scan loop error:", e)
@@ -2101,13 +2126,11 @@ def test_bybit_connection():
         return
 
     try:
-        print("Testing Bybit market data...")
         ticker = session.get_tickers(category=CATEGORY, symbol=BYBIT_SYMBOL)
-        print("Bybit ticker OK:", ticker)
+        print("Bybit ticker OK:", bool(ticker))
 
-        print("Testing Bybit wallet balance endpoint...")
         account = get_bybit_account_wallet()
-        print("Bybit wallet OK:", account)
+        print("Bybit wallet OK:", bool(account))
 
         refresh_bybit_linear_symbols()
 
@@ -2131,6 +2154,8 @@ def main():
     print("CATEGORY =", CATEGORY)
     print("TOP_N =", TOP_N)
     print("LIVE_WS_SYMBOLS =", LIVE_WS_SYMBOLS)
+    print("HISTORY_LIMIT =", HISTORY_LIMIT)
+    print("SHORTLIST_REFRESH_SECONDS =", SHORTLIST_REFRESH_SECONDS)
     print("TIMEFRAMES =", TIMEFRAMES)
     print("WS_DEBUG =", WS_DEBUG)
     print("BYBIT_TRADING_ENABLED =", BYBIT_TRADING_ENABLED)
@@ -2154,6 +2179,8 @@ def main():
     print("DAILY_REPORT_ENABLED =", DAILY_REPORT_ENABLED)
     print("DAILY_REPORT_HOUR =", DAILY_REPORT_HOUR)
     print("DEFAULT_MAX_OPEN_POSITIONS =", DEFAULT_MAX_OPEN_POSITIONS)
+
+    threading.Thread(target=telegram_sender_loop, daemon=True).start()
 
     send_telegram("🚀 Scanner started")
     send_telegram("✅ Telegram test message")
