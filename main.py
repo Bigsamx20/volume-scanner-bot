@@ -58,22 +58,16 @@ AUTO_SCAN_INTERVAL_SECONDS = float(os.getenv("AUTO_SCAN_INTERVAL_SECONDS", "10")
 DEFAULT_EXTREME_ALERTS_ENABLED = os.getenv("EXTREME_ALERTS_ENABLED", "true").lower() == "true"
 
 # Private bot chat:
-# RSI <= 10  -> alert
-# RSI >= 90  -> alert
 PRIVATE_RSI_VERY_LOW = float(os.getenv("PRIVATE_RSI_VERY_LOW", "10"))
 PRIVATE_RSI_VERY_HIGH = float(os.getenv("PRIVATE_RSI_VERY_HIGH", "90"))
 
-# Private + group clean signal:
-# RSI <= 7   -> BUY NOW
-# RSI >= 93  -> SELL NOW (group premium)
+# Group premium clean signals:
 GROUP_SIGNAL_RSI_BUY = float(os.getenv("GROUP_SIGNAL_RSI_BUY", "7"))
 GROUP_SIGNAL_RSI_SELL = float(os.getenv("GROUP_SIGNAL_RSI_SELL", "93"))
 
-# Private extreme raw signal:
-# RSI >= 95 -> EXTREME SELL NOW
+# Private-only extreme sell raw alert:
 PRIVATE_EXTREME_SELL = float(os.getenv("PRIVATE_EXTREME_SELL", "95"))
 
-# Keep legacy env names for compatibility
 DEFAULT_EXTREME_RSI_BUY = float(os.getenv("EXTREME_RSI_BUY", str(GROUP_SIGNAL_RSI_BUY)))
 DEFAULT_EXTREME_RSI_SELL = float(os.getenv("EXTREME_RSI_SELL", str(PRIVATE_EXTREME_SELL)))
 
@@ -202,54 +196,56 @@ def send_telegram_to_chat(chat_id: str, message: str):
         print(f"Telegram error for {chat_id}: {e}")
 
 
+def send_private_alert(message: str):
+    if CHAT_ID:
+        send_telegram_to_chat(CHAT_ID, message)
+
+
+def send_group_alert(message: str):
+    if GROUP_CHAT_ID:
+        send_telegram_to_chat(GROUP_CHAT_ID, message)
+
+
 def send_telegram(message: str):
     """
     Shared/system messages to both private chat and group.
+    Use this only for things you want BOTH places to see.
     """
+    seen = set()
     targets = []
     if CHAT_ID:
         targets.append(CHAT_ID)
     if GROUP_CHAT_ID:
         targets.append(GROUP_CHAT_ID)
 
-    seen = set()
-    targets = [x for x in targets if x and not (x in seen or seen.add(x))]
-
     for target_chat_id in targets:
+        if target_chat_id in seen:
+            continue
+        seen.add(target_chat_id)
         send_telegram_to_chat(target_chat_id, message)
 
 
-def send_private_alert(message: str):
-    """
-    Raw alerts only to private bot chat.
-    """
-    if CHAT_ID:
-        send_telegram_to_chat(CHAT_ID, message)
-
-
-def build_clean_signal_message(side: str, symbol: str, timeframe: str = "5m") -> str:
+def build_clean_signal_message(side: str, symbol: str, timeframe: str = "5") -> str:
     side = side.upper()
     emoji = "🟢" if side == "BUY" else "🔴"
+    tf_text = timeframe if str(timeframe).endswith("m") else f"{timeframe}m"
+
     return (
         f"{emoji} {side} NOW\n"
         f"Symbol: {symbol}\n"
         f"Stop Loss: No Stop Loss\n"
         f"Take Profit: 3% and above\n"
-        f"Timeframe: {timeframe}m\n\n"
+        f"Timeframe: {tf_text}\n\n"
         f"Trading-Style: Scalping"
     )
 
 
-def send_group_signal(side: str, symbol: str, timeframe: str = "5"):
-    if not GROUP_CHAT_ID:
-        return
-    send_telegram_to_chat(GROUP_CHAT_ID, build_clean_signal_message(side, symbol, timeframe))
-
-
 def send_private_signal(side: str, symbol: str, timeframe: str = "5"):
-    if not CHAT_ID:
-        return
-    send_telegram_to_chat(CHAT_ID, build_clean_signal_message(side, symbol, timeframe))
+    send_private_alert(build_clean_signal_message(side, symbol, timeframe))
+
+
+def send_group_signal(side: str, symbol: str, timeframe: str = "5"):
+    send_group_alert(build_clean_signal_message(side, symbol, timeframe))
 
 
 def send_private_and_group_signal(side: str, symbol: str, timeframe: str = "5"):
@@ -284,7 +280,8 @@ def heartbeat():
     while True:
         print("BOT ALIVE ✅")
         if HEARTBEAT_TO_TELEGRAM:
-            send_telegram("BOT ALIVE ✅")
+            # PRIVATE ONLY
+            send_private_alert("BOT ALIVE ✅")
         time.sleep(HEARTBEAT_SECONDS)
 
 
@@ -459,7 +456,7 @@ def process_extreme_rsi_alerts(symbol: str, tf: str, candle_start: int, rsi_valu
                 f"Threshold: {PRIVATE_RSI_VERY_HIGH:.2f}"
             )
 
-    # BUY NOW to private + group only when RSI <= 7
+    # BUY NOW to private + group when RSI <= 7
     if rsi_value <= GROUP_SIGNAL_RSI_BUY:
         if should_alert_once_per_candle("clean_buy_signal", symbol, tf, candle_start):
             send_private_alert(
@@ -1170,7 +1167,7 @@ def process_indicators(symbol: str, tf: str, candle_start: int):
             overbought = float(rsi_cfg.get("overbought", 70))
             oversold = float(rsi_cfg.get("oversold", 30))
 
-            # Raw alerts to private chat only
+            # Raw alerts to private bot only
             if r >= overbought:
                 if should_alert_once_per_candle("rsi_overbought", symbol, tf, candle_start):
                     send_private_alert(
@@ -1546,7 +1543,8 @@ def auto_entry_loop():
                                 f"\nTrailing stop: {ts_text}"
                             )
 
-                    send_telegram(msg)
+                    # PRIVATE ONLY
+                    send_private_alert(msg)
                     time.sleep(1.0)
                 except Exception as e:
                     print(f"Auto buy failed for {symbol}: {e}")
@@ -1596,7 +1594,7 @@ def auto_exit_loop():
                     if stop_loss_price is not None and current_price <= stop_loss_price:
                         order, trade = place_bybit_market_sell(symbol, reason="stop_loss")
                         pnl_text = "" if not trade else f"\nPnL: {trade['pnl_usdt']:.8f} USDT ({trade['pnl_pct']:.2f}%)"
-                        send_telegram(
+                        send_private_alert(
                             f"🛑 STOP LOSS HIT\n"
                             f"Symbol: {symbol}\n"
                             f"Entry: {entry_price:.8f}\n"
@@ -1609,7 +1607,7 @@ def auto_exit_loop():
                     if take_profit_price is not None and current_price >= take_profit_price:
                         order, trade = place_bybit_market_sell(symbol, reason="take_profit")
                         pnl_text = "" if not trade else f"\nPnL: {trade['pnl_usdt']:.8f} USDT ({trade['pnl_pct']:.2f}%)"
-                        send_telegram(
+                        send_private_alert(
                             f"🎯 TAKE PROFIT HIT\n"
                             f"Symbol: {symbol}\n"
                             f"Entry: {entry_price:.8f}\n"
@@ -1622,7 +1620,7 @@ def auto_exit_loop():
                     if trailing_active and trailing_stop_price is not None and current_price <= trailing_stop_price:
                         order, trade = place_bybit_market_sell(symbol, reason="trailing_stop")
                         pnl_text = "" if not trade else f"\nPnL: {trade['pnl_usdt']:.8f} USDT ({trade['pnl_pct']:.2f}%)"
-                        send_telegram(
+                        send_private_alert(
                             f"🔒 TRAILING STOP HIT\n"
                             f"Symbol: {symbol}\n"
                             f"Entry: {entry_price:.8f}\n"
@@ -1637,7 +1635,7 @@ def auto_exit_loop():
                     if current_rsi is not None and current_rsi >= RSI_SELL_THRESHOLD:
                         order, trade = place_bybit_market_sell(symbol, reason="rsi_exit")
                         pnl_text = "" if not trade else f"\nPnL: {trade['pnl_usdt']:.8f} USDT ({trade['pnl_pct']:.2f}%)"
-                        send_telegram(
+                        send_private_alert(
                             f"🔴 AUTO SELL (RSI EXIT)\n"
                             f"Symbol: {symbol}\n"
                             f"RSI(5m): {current_rsi:.2f}\n"
@@ -1805,7 +1803,10 @@ def telegram_command_loop():
                 last_command_time = now
 
                 if text == "/test":
-                    send_telegram("✅ Telegram command test OK")
+                    send_private_alert("✅ Telegram private command test OK")
+
+                elif text == "/testgroup":
+                    send_group_signal("BUY", "BTCUSDT", "5")
 
                 elif text == "/force":
                     force_test_alerts()
@@ -1817,22 +1818,22 @@ def telegram_command_loop():
                     send_private_and_group_signal("SELL", "BTCUSDT", "5")
 
                 elif text == "/status":
-                    send_telegram(get_status_text())
+                    send_private_alert(get_status_text())
 
                 elif text == "/symbols":
-                    send_telegram(get_symbols_text())
+                    send_private_alert(get_symbols_text())
 
                 elif text == "/diag":
-                    send_telegram(get_diag_text())
+                    send_private_alert(get_diag_text())
 
                 elif text in ("/bybit", "/binance"):
                     test_bybit_connection()
 
                 elif text == "/bbal":
                     try:
-                        send_telegram(get_bybit_nonzero_balances_text())
+                        send_private_alert(get_bybit_nonzero_balances_text())
                     except Exception as e:
-                        send_telegram(f"❌ Bybit balance check failed\n{e}")
+                        send_private_alert(f"❌ Bybit balance check failed\n{e}")
 
                 elif text == "/buy":
                     try:
@@ -1853,83 +1854,83 @@ def telegram_command_loop():
                             if pos:
                                 msg += f"\nAvg entry: {pos['entry_price']:.8f}\nQty: {pos['quantity']}"
 
-                        send_telegram(msg)
+                        send_private_alert(msg)
                     except Exception as e:
-                        send_telegram(f"❌ Bybit MAINNET BUY failed\n{e}")
+                        send_private_alert(f"❌ Bybit MAINNET BUY failed\n{e}")
 
                 elif text == "/sell":
                     try:
                         order, trade = place_bybit_market_sell(BYBIT_SYMBOL, reason="manual_sell")
                         pnl_text = "" if not trade else f"\nPnL: {trade['pnl_usdt']:.8f} USDT ({trade['pnl_pct']:.2f}%)"
-                        send_telegram(
+                        send_private_alert(
                             f"✅ Bybit MAINNET SELL placed\n"
                             f"Symbol: {BYBIT_SYMBOL}\n"
                             f"Order ID: {order.get('result', {}).get('orderId')}{pnl_text}"
                         )
                     except Exception as e:
-                        send_telegram(f"❌ Bybit MAINNET SELL failed\n{e}")
+                        send_private_alert(f"❌ Bybit MAINNET SELL failed\n{e}")
 
                 elif text == "/panicclose":
                     try:
                         closed_symbols, errors = panic_close_all_positions()
                         if not closed_symbols and not errors:
-                            send_telegram("📭 PANIC CLOSE: No open long positions found.")
+                            send_private_alert("📭 PANIC CLOSE: No open long positions found.")
                         else:
                             msg = "🚨 PANIC CLOSE ACTIVATED\n"
                             if closed_symbols:
                                 msg += "Closed:\n" + "\n".join(closed_symbols[:50])
                             if errors:
                                 msg += "\n\nErrors:\n" + "\n".join(errors[:20])
-                            send_telegram(msg)
+                            send_private_alert(msg)
                     except Exception as e:
-                        send_telegram(f"❌ PANIC CLOSE failed\n{e}")
+                        send_private_alert(f"❌ PANIC CLOSE failed\n{e}")
 
                 elif text == "/pnl":
-                    send_telegram(get_pnl_text())
+                    send_private_alert(get_pnl_text())
 
                 elif text == "/dailyreport":
-                    send_telegram(get_pnl_text(day_filter=today_str_from_ts(now_ts())))
+                    send_private_alert(get_pnl_text(day_filter=today_str_from_ts(now_ts())))
 
                 elif text == "/trades":
-                    send_telegram(get_recent_trades_text())
+                    send_private_alert(get_recent_trades_text())
 
                 elif text == "/autoon":
                     AUTO_TRADING_ENABLED = True
-                    send_telegram("✅ Auto trading enabled")
+                    send_private_alert("✅ Auto trading enabled")
 
                 elif text == "/autooff":
                     AUTO_TRADING_ENABLED = False
-                    send_telegram("⏸ Auto trading disabled")
+                    send_private_alert("⏸ Auto trading disabled")
 
                 elif text == "/extremeon":
                     EXTREME_ALERTS_ENABLED = True
-                    send_telegram("✅ Extreme RSI alerts enabled")
+                    send_private_alert("✅ Extreme RSI alerts enabled")
 
                 elif text == "/extremeoff":
                     EXTREME_ALERTS_ENABLED = False
-                    send_telegram("⏸ Extreme RSI alerts disabled")
+                    send_private_alert("⏸ Extreme RSI alerts disabled")
 
                 elif text == "/showstrategy":
-                    send_telegram(get_strategy_text())
+                    send_private_alert(get_strategy_text())
 
                 elif text == "/showpositions":
-                    send_telegram(get_positions_text())
+                    send_private_alert(get_positions_text())
 
                 elif text.startswith("/setrsibuy "):
                     try:
                         value = float(text.split(maxsplit=1)[1].strip())
                         RSI_BUY_THRESHOLD = value
-                        send_telegram(f"✅ Buy RSI threshold updated to {RSI_BUY_THRESHOLD:.2f}")
+                        send_private_alert(f"✅ Buy RSI threshold updated to {RSI_BUY_THRESHOLD:.2f}")
                     except Exception as e:
-                        send_telegram(f"❌ Failed to set buy RSI threshold\n{e}")
+                        send_private_alert(f"❌ Failed to set buy RSI threshold\n{e}")
 
                 elif text.startswith("/setrsisell "):
                     try:
                         value = float(text.split(maxsplit=1)[1].strip())
                         RSI_SELL_THRESHOLD = value
-                        send_telegram(f"✅ Sell RSI threshold updated to {RSI_SELL_THRESHOLD:.2f}")
+                        send_private_alert(f"✅ Sell RSI threshold updated to {RSI_SELL_THRESHOLD:.2f}")
                     except Exception as e:
-                        send_telegram(f"❌ Failed to set sell RSI threshold\n{e}")
+                        send_private_alert(f"❌ Failed to set sell RSI threshold\n{e}")
 
                 elif text.startswith("/setsl "):
                     try:
@@ -1938,7 +1939,7 @@ def telegram_command_loop():
                             raise Exception("Stop loss cannot be negative")
                         STOP_LOSS_PCT = value
                         refresh_all_position_risk_levels()
-                        send_telegram(
+                        send_private_alert(
                             f"✅ Stop loss updated\n"
                             f"Stop loss: {pct_text(STOP_LOSS_PCT)}\n"
                             f"Take profit: {pct_text(TAKE_PROFIT_PCT)}\n"
@@ -1946,7 +1947,7 @@ def telegram_command_loop():
                             f"Trail start: {pct_text(TRAILING_START_PCT)}"
                         )
                     except Exception as e:
-                        send_telegram(f"❌ Failed to set stop loss\n{e}")
+                        send_private_alert(f"❌ Failed to set stop loss\n{e}")
 
                 elif text.startswith("/settp "):
                     try:
@@ -1955,7 +1956,7 @@ def telegram_command_loop():
                             raise Exception("Take profit cannot be negative")
                         TAKE_PROFIT_PCT = value
                         refresh_all_position_risk_levels()
-                        send_telegram(
+                        send_private_alert(
                             f"✅ Take profit updated\n"
                             f"Stop loss: {pct_text(STOP_LOSS_PCT)}\n"
                             f"Take profit: {pct_text(TAKE_PROFIT_PCT)}\n"
@@ -1963,7 +1964,7 @@ def telegram_command_loop():
                             f"Trail start: {pct_text(TRAILING_START_PCT)}"
                         )
                     except Exception as e:
-                        send_telegram(f"❌ Failed to set take profit\n{e}")
+                        send_private_alert(f"❌ Failed to set take profit\n{e}")
 
                 elif text.startswith("/settrailing "):
                     try:
@@ -1972,7 +1973,7 @@ def telegram_command_loop():
                             raise Exception("Trailing stop cannot be negative")
                         TRAILING_STOP_PCT = value
                         refresh_all_position_risk_levels()
-                        send_telegram(
+                        send_private_alert(
                             f"✅ Trailing stop updated\n"
                             f"Stop loss: {pct_text(STOP_LOSS_PCT)}\n"
                             f"Take profit: {pct_text(TAKE_PROFIT_PCT)}\n"
@@ -1980,7 +1981,7 @@ def telegram_command_loop():
                             f"Trail start: {pct_text(TRAILING_START_PCT)}"
                         )
                     except Exception as e:
-                        send_telegram(f"❌ Failed to set trailing stop\n{e}")
+                        send_private_alert(f"❌ Failed to set trailing stop\n{e}")
 
                 elif text.startswith("/settrailstart "):
                     try:
@@ -1989,7 +1990,7 @@ def telegram_command_loop():
                             raise Exception("Trailing activation cannot be negative")
                         TRAILING_START_PCT = value
                         refresh_all_position_risk_levels()
-                        send_telegram(
+                        send_private_alert(
                             f"✅ Trailing activation updated\n"
                             f"Stop loss: {pct_text(STOP_LOSS_PCT)}\n"
                             f"Take profit: {pct_text(TAKE_PROFIT_PCT)}\n"
@@ -1997,7 +1998,7 @@ def telegram_command_loop():
                             f"Trail start: {pct_text(TRAILING_START_PCT)}"
                         )
                     except Exception as e:
-                        send_telegram(f"❌ Failed to set trailing activation\n{e}")
+                        send_private_alert(f"❌ Failed to set trailing activation\n{e}")
 
                 elif text.startswith("/setmaxcoins "):
                     try:
@@ -2005,9 +2006,9 @@ def telegram_command_loop():
                         if value <= 0:
                             raise Exception("Max coins must be greater than 0")
                         MAX_OPEN_POSITIONS = value
-                        send_telegram(f"✅ Max open positions updated to {MAX_OPEN_POSITIONS}")
+                        send_private_alert(f"✅ Max open positions updated to {MAX_OPEN_POSITIONS}")
                     except Exception as e:
-                        send_telegram(f"❌ Failed to set max coins\n{e}")
+                        send_private_alert(f"❌ Failed to set max coins\n{e}")
 
                 elif text.startswith("/setcooldown "):
                     try:
@@ -2015,9 +2016,9 @@ def telegram_command_loop():
                         if value < 0:
                             raise Exception("Cooldown cannot be negative")
                         SYMBOL_COOLDOWN_SECONDS = value
-                        send_telegram(f"✅ Symbol cooldown updated to {SYMBOL_COOLDOWN_SECONDS} seconds")
+                        send_private_alert(f"✅ Symbol cooldown updated to {SYMBOL_COOLDOWN_SECONDS} seconds")
                     except Exception as e:
-                        send_telegram(f"❌ Failed to set cooldown\n{e}")
+                        send_private_alert(f"❌ Failed to set cooldown\n{e}")
 
                 elif text.startswith("/setsize "):
                     try:
@@ -2025,14 +2026,14 @@ def telegram_command_loop():
                         if value <= 0:
                             raise Exception("Trade size must be greater than 0")
                         TRADE_SIZE_USDT = value
-                        send_telegram(
+                        send_private_alert(
                             f"✅ Trade size updated\n"
                             f"Trade size (margin): {TRADE_SIZE_USDT:.4f} USDT\n"
                             f"Leverage: {LEVERAGE}x\n"
                             f"Approx notional/trade: {(TRADE_SIZE_USDT * LEVERAGE):.4f} USDT"
                         )
                     except Exception as e:
-                        send_telegram(f"❌ Failed to set trade size\n{e}")
+                        send_private_alert(f"❌ Failed to set trade size\n{e}")
 
                 elif text.startswith("/setlev "):
                     try:
@@ -2040,7 +2041,7 @@ def telegram_command_loop():
                         if value < 1:
                             raise Exception("Leverage must be at least 1")
                         LEVERAGE = value
-                        send_telegram(
+                        send_private_alert(
                             f"✅ Leverage updated\n"
                             f"Trade size (margin): {TRADE_SIZE_USDT:.4f} USDT\n"
                             f"Leverage: {LEVERAGE}x\n"
@@ -2048,12 +2049,13 @@ def telegram_command_loop():
                             f"Note: actual applied leverage may be capped per symbol by Bybit."
                         )
                     except Exception as e:
-                        send_telegram(f"❌ Failed to set leverage\n{e}")
+                        send_private_alert(f"❌ Failed to set leverage\n{e}")
 
                 elif text == "/help":
-                    send_telegram(
+                    send_private_alert(
                         "Available commands:\n"
-                        "/test - Telegram test\n"
+                        "/test - private test\n"
+                        "/testgroup - test clean signal to group only\n"
                         "/force - force fake raw alert to private chat\n"
                         "/forcesignalbuy - force clean BUY signal to private + group\n"
                         "/forcesignalsell - force clean SELL signal to private + group\n"
@@ -2105,7 +2107,8 @@ def daily_report_loop():
                 now = datetime.now()
                 current_date = now.strftime("%Y-%m-%d")
                 if now.hour == DAILY_REPORT_HOUR and last_daily_report_date != current_date:
-                    send_telegram(get_pnl_text(day_filter=current_date))
+                    # PRIVATE ONLY
+                    send_private_alert(get_pnl_text(day_filter=current_date))
                     last_daily_report_date = current_date
         except Exception as e:
             print("Daily report loop error:", e)
@@ -2163,7 +2166,7 @@ def test_bybit_connection():
 
     if not bybit_keys_ready():
         print("Bybit keys missing")
-        send_telegram("❌ Bybit mainnet keys missing")
+        send_private_alert("❌ Bybit mainnet keys missing")
         return
 
     try:
@@ -2177,7 +2180,7 @@ def test_bybit_connection():
 
         refresh_bybit_linear_symbols()
 
-        send_telegram(
+        send_private_alert(
             f"✅ Bybit MAINNET connected\n"
             f"Category: {CATEGORY}\n"
             f"Symbol: {BYBIT_SYMBOL}\n"
@@ -2185,7 +2188,7 @@ def test_bybit_connection():
         )
     except Exception as e:
         print("Bybit mainnet connection failed:", e)
-        send_telegram(f"❌ Bybit MAINNET connection failed\n{e}")
+        send_private_alert(f"❌ Bybit MAINNET connection failed\n{e}")
 
 
 def main():
@@ -2221,8 +2224,9 @@ def main():
     print("DAILY_REPORT_HOUR =", DAILY_REPORT_HOUR)
     print("DEFAULT_MAX_OPEN_POSITIONS =", DEFAULT_MAX_OPEN_POSITIONS)
 
-    send_telegram("🚀 Scanner started")
-    send_telegram("✅ Telegram test message")
+    # PRIVATE ONLY
+    send_private_alert("🚀 Scanner started")
+    send_private_alert("✅ Telegram private test message")
 
     test_bybit_connection()
 
