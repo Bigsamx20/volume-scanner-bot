@@ -176,6 +176,15 @@ EXTREME_ALERTS_ENABLED = DEFAULT_EXTREME_ALERTS_ENABLED
 EXTREME_RSI_BUY = DEFAULT_EXTREME_RSI_BUY
 EXTREME_RSI_SELL = DEFAULT_EXTREME_RSI_SELL
 
+GIANT_CANDLE_ALERTS_ENABLED_RUNTIME = GIANT_CANDLE_ALERTS_ENABLED
+GIANT_CANDLE_CLOSED_ALERTS_ENABLED_RUNTIME = GIANT_CANDLE_CLOSED_ALERTS_ENABLED
+GIANT_CANDLE_LIVE_ALERTS_ENABLED_RUNTIME = GIANT_CANDLE_LIVE_ALERTS_ENABLED
+GIANT_CANDLE_BODY_PCT_RUNTIME = GIANT_CANDLE_BODY_PCT
+GIANT_CANDLE_RANGE_PCT_RUNTIME = GIANT_CANDLE_RANGE_PCT
+GIANT_CANDLE_USE_BODY_RUNTIME = GIANT_CANDLE_USE_BODY
+GIANT_CANDLE_USE_RANGE_RUNTIME = GIANT_CANDLE_USE_RANGE
+GIANT_CANDLE_REQUIRE_SAME_COLOR_BODY_RUNTIME = GIANT_CANDLE_REQUIRE_SAME_COLOR_BODY
+
 positions = {}
 symbol_cooldowns = {}
 
@@ -467,10 +476,10 @@ def giant_candle_match(candle: dict) -> bool:
     if not metrics:
         return False
 
-    body_ok = (not GIANT_CANDLE_USE_BODY) or (metrics["body_pct"] >= GIANT_CANDLE_BODY_PCT)
-    range_ok = (not GIANT_CANDLE_USE_RANGE) or (metrics["range_pct"] >= GIANT_CANDLE_RANGE_PCT)
+    body_ok = (not GIANT_CANDLE_USE_BODY_RUNTIME) or (metrics["body_pct"] >= GIANT_CANDLE_BODY_PCT_RUNTIME)
+    range_ok = (not GIANT_CANDLE_USE_RANGE_RUNTIME) or (metrics["range_pct"] >= GIANT_CANDLE_RANGE_PCT_RUNTIME)
 
-    if GIANT_CANDLE_REQUIRE_SAME_COLOR_BODY and metrics["direction"] == "NEUTRAL":
+    if GIANT_CANDLE_REQUIRE_SAME_COLOR_BODY_RUNTIME and metrics["direction"] == "NEUTRAL":
         return False
 
     return body_ok and range_ok
@@ -482,24 +491,42 @@ def build_giant_candle_message(symbol: str, tf: str, candle: dict, live_mode: bo
     icon = "🟡" if live_mode else "🟠"
 
     return (
-        f"{icon} {status}\n"
-        f"Symbol: {symbol}\n"
-        f"Timeframe: {tf}\n"
-        f"Candle start: {ts_to_text(int(candle['start']) / 1000 if int(candle['start']) > 9999999999 else int(candle['start']))}\n"
-        f"Direction: {metrics['direction']}\n"
-        f"Open: {metrics['open']:.8f}\n"
-        f"High: {metrics['high']:.8f}\n"
-        f"Low: {metrics['low']:.8f}\n"
-        f"Close: {metrics['close']:.8f}\n"
-        f"Body %: {metrics['body_pct']:.4f}%\n"
-        f"Range %: {metrics['range_pct']:.4f}%\n"
-        f"Body threshold: {GIANT_CANDLE_BODY_PCT:.4f}%\n"
-        f"Range threshold: {GIANT_CANDLE_RANGE_PCT:.4f}%"
+        f"{icon} {status}
+"
+        f"Symbol: {symbol}
+"
+        f"Timeframe: {tf}
+"
+        f"Candle start: {ts_to_text(int(candle['start']) / 1000 if int(candle['start']) > 9999999999 else int(candle['start']))}
+"
+        f"Direction: {metrics['direction']}
+"
+        f"Open: {metrics['open']:.8f}
+"
+        f"High: {metrics['high']:.8f}
+"
+        f"Low: {metrics['low']:.8f}
+"
+        f"Close: {metrics['close']:.8f}
+"
+        f"Body %: {metrics['body_pct']:.4f}%
+"
+        f"Range %: {metrics['range_pct']:.4f}%
+"
+        f"Body threshold: {GIANT_CANDLE_BODY_PCT_RUNTIME:.4f}%
+"
+        f"Range threshold: {GIANT_CANDLE_RANGE_PCT_RUNTIME:.4f}%
+"
+        f"Use body: {GIANT_CANDLE_USE_BODY_RUNTIME}
+"
+        f"Use range: {GIANT_CANDLE_USE_RANGE_RUNTIME}
+"
+        f"Require direction: {GIANT_CANDLE_REQUIRE_SAME_COLOR_BODY_RUNTIME}"
     )
 
 
 def process_giant_candle_alerts(symbol: str, tf: str, candle: dict):
-    if not GIANT_CANDLE_ALERTS_ENABLED:
+    if not GIANT_CANDLE_ALERTS_ENABLED_RUNTIME:
         return
 
     if not giant_candle_match(candle):
@@ -511,11 +538,11 @@ def process_giant_candle_alerts(symbol: str, tf: str, candle: dict):
 
     is_confirmed = bool(candle.get("confirm", False))
 
-    if is_confirmed and GIANT_CANDLE_CLOSED_ALERTS_ENABLED:
+    if is_confirmed and GIANT_CANDLE_CLOSED_ALERTS_ENABLED_RUNTIME:
         if should_alert_once_per_candle("giant_candle_closed", symbol, tf, candle_start):
             send_private_alert(build_giant_candle_message(symbol, tf, candle, live_mode=False))
 
-    if (not is_confirmed) and GIANT_CANDLE_LIVE_ALERTS_ENABLED:
+    if (not is_confirmed) and GIANT_CANDLE_LIVE_ALERTS_ENABLED_RUNTIME:
         if should_alert_once_per_candle("giant_candle_live", symbol, tf, candle_start):
             send_private_alert(build_giant_candle_message(symbol, tf, candle, live_mode=True))
 
@@ -1033,11 +1060,22 @@ def get_strategy_text():
         f"Buy rule: 5m RSI <= {RSI_BUY_THRESHOLD:.2f}\n"
         f"Sell rule: 5m RSI >= {RSI_SELL_THRESHOLD:.2f} OR SL/TP/Trailing\n"
         f"Extreme alerts enabled: {EXTREME_ALERTS_ENABLED}\n"
-        f"Giant candle alerts enabled: {GIANT_CANDLE_ALERTS_ENABLED}\n"
-        f"Giant candle closed alerts: {GIANT_CANDLE_CLOSED_ALERTS_ENABLED}\n"
-        f"Giant candle live alerts: {GIANT_CANDLE_LIVE_ALERTS_ENABLED}\n"
-        f"Giant candle body threshold: {GIANT_CANDLE_BODY_PCT:.4f}%\n"
-        f"Giant candle range threshold: {GIANT_CANDLE_RANGE_PCT:.4f}%\n"
+        f"Giant candle alerts enabled: {GIANT_CANDLE_ALERTS_ENABLED_RUNTIME}
+"
+        f"Giant candle closed alerts: {GIANT_CANDLE_CLOSED_ALERTS_ENABLED_RUNTIME}
+"
+        f"Giant candle live alerts: {GIANT_CANDLE_LIVE_ALERTS_ENABLED_RUNTIME}
+"
+        f"Giant candle body threshold: {GIANT_CANDLE_BODY_PCT_RUNTIME:.4f}%
+"
+        f"Giant candle range threshold: {GIANT_CANDLE_RANGE_PCT_RUNTIME:.4f}%
+"
+        f"Giant candle use body: {GIANT_CANDLE_USE_BODY_RUNTIME}
+"
+        f"Giant candle use range: {GIANT_CANDLE_USE_RANGE_RUNTIME}
+"
+        f"Giant candle require direction: {GIANT_CANDLE_REQUIRE_SAME_COLOR_BODY_RUNTIME}
+"
         f"Private RSI very low <= {PRIVATE_RSI_VERY_LOW:.2f}\n"
         f"Private RSI very high >= {PRIVATE_RSI_VERY_HIGH:.2f}\n"
         f"Group signal BUY <= {GROUP_SIGNAL_RSI_BUY:.2f}\n"
@@ -1847,11 +1885,22 @@ def get_status_text():
         f"Bybit keys loaded: {bybit_keys_ready()}\n"
         f"Auto trading enabled: {AUTO_TRADING_ENABLED}\n"
         f"Extreme alerts enabled: {EXTREME_ALERTS_ENABLED}\n"
-        f"Giant candle alerts enabled: {GIANT_CANDLE_ALERTS_ENABLED}\n"
-        f"Giant candle closed alerts enabled: {GIANT_CANDLE_CLOSED_ALERTS_ENABLED}\n"
-        f"Giant candle live alerts enabled: {GIANT_CANDLE_LIVE_ALERTS_ENABLED}\n"
-        f"Giant candle body threshold: {GIANT_CANDLE_BODY_PCT:.4f}%\n"
-        f"Giant candle range threshold: {GIANT_CANDLE_RANGE_PCT:.4f}%\n"
+        f"Giant candle alerts enabled: {GIANT_CANDLE_ALERTS_ENABLED_RUNTIME}
+"
+        f"Giant candle closed alerts enabled: {GIANT_CANDLE_CLOSED_ALERTS_ENABLED_RUNTIME}
+"
+        f"Giant candle live alerts enabled: {GIANT_CANDLE_LIVE_ALERTS_ENABLED_RUNTIME}
+"
+        f"Giant candle body threshold: {GIANT_CANDLE_BODY_PCT_RUNTIME:.4f}%
+"
+        f"Giant candle range threshold: {GIANT_CANDLE_RANGE_PCT_RUNTIME:.4f}%
+"
+        f"Giant candle use body: {GIANT_CANDLE_USE_BODY_RUNTIME}
+"
+        f"Giant candle use range: {GIANT_CANDLE_USE_RANGE_RUNTIME}
+"
+        f"Giant candle require direction: {GIANT_CANDLE_REQUIRE_SAME_COLOR_BODY_RUNTIME}
+"
         f"Daily report enabled: {DAILY_REPORT_ENABLED}\n"
         f"Current open positions: {get_open_positions_count()}\n"
         f"Max open positions: {MAX_OPEN_POSITIONS}\n"
@@ -1905,11 +1954,22 @@ def get_diag_text():
         f"BYBIT_KEYS_READY: {bybit_keys_ready()}\n"
         f"AUTO_TRADING_ENABLED: {AUTO_TRADING_ENABLED}\n"
         f"EXTREME_ALERTS_ENABLED: {EXTREME_ALERTS_ENABLED}\n"
-        f"GIANT_CANDLE_ALERTS_ENABLED: {GIANT_CANDLE_ALERTS_ENABLED}\n"
-        f"GIANT_CANDLE_CLOSED_ALERTS_ENABLED: {GIANT_CANDLE_CLOSED_ALERTS_ENABLED}\n"
-        f"GIANT_CANDLE_LIVE_ALERTS_ENABLED: {GIANT_CANDLE_LIVE_ALERTS_ENABLED}\n"
-        f"GIANT_CANDLE_BODY_PCT: {GIANT_CANDLE_BODY_PCT}\n"
-        f"GIANT_CANDLE_RANGE_PCT: {GIANT_CANDLE_RANGE_PCT}\n"
+        f"GIANT_CANDLE_ALERTS_ENABLED: {GIANT_CANDLE_ALERTS_ENABLED_RUNTIME}
+"
+        f"GIANT_CANDLE_CLOSED_ALERTS_ENABLED: {GIANT_CANDLE_CLOSED_ALERTS_ENABLED_RUNTIME}
+"
+        f"GIANT_CANDLE_LIVE_ALERTS_ENABLED: {GIANT_CANDLE_LIVE_ALERTS_ENABLED_RUNTIME}
+"
+        f"GIANT_CANDLE_BODY_PCT: {GIANT_CANDLE_BODY_PCT_RUNTIME}
+"
+        f"GIANT_CANDLE_RANGE_PCT: {GIANT_CANDLE_RANGE_PCT_RUNTIME}
+"
+        f"GIANT_CANDLE_USE_BODY: {GIANT_CANDLE_USE_BODY_RUNTIME}
+"
+        f"GIANT_CANDLE_USE_RANGE: {GIANT_CANDLE_USE_RANGE_RUNTIME}
+"
+        f"GIANT_CANDLE_REQUIRE_SAME_COLOR_BODY: {GIANT_CANDLE_REQUIRE_SAME_COLOR_BODY_RUNTIME}
+"
         f"GROUP_ALERTS_ENABLED: {GROUP_ALERTS_ENABLED}\n"
         f"DAILY_REPORT_ENABLED: {DAILY_REPORT_ENABLED}\n"
         f"RSI_BUY_THRESHOLD: {RSI_BUY_THRESHOLD}\n"
@@ -1938,6 +1998,10 @@ def telegram_command_loop():
     global RSI_BUY_THRESHOLD, RSI_SELL_THRESHOLD, MAX_OPEN_POSITIONS, SYMBOL_COOLDOWN_SECONDS
     global TRADE_SIZE_USDT, LEVERAGE
     global EXTREME_ALERTS_ENABLED
+    global GIANT_CANDLE_ALERTS_ENABLED_RUNTIME, GIANT_CANDLE_CLOSED_ALERTS_ENABLED_RUNTIME
+    global GIANT_CANDLE_LIVE_ALERTS_ENABLED_RUNTIME, GIANT_CANDLE_BODY_PCT_RUNTIME
+    global GIANT_CANDLE_RANGE_PCT_RUNTIME, GIANT_CANDLE_USE_BODY_RUNTIME
+    global GIANT_CANDLE_USE_RANGE_RUNTIME, GIANT_CANDLE_REQUIRE_SAME_COLOR_BODY_RUNTIME
 
     if not TELEGRAM_ENABLED:
         print("Telegram command loop disabled")
@@ -2087,6 +2151,97 @@ def telegram_command_loop():
 
                 elif text == "/showstrategy":
                     send_private_alert(get_strategy_text())
+
+                elif text == "/showgiant":
+                    send_private_alert(
+                        f"🕯 GIANT CANDLE SETTINGS
+"
+                        f"Enabled: {GIANT_CANDLE_ALERTS_ENABLED_RUNTIME}
+"
+                        f"Closed alerts: {GIANT_CANDLE_CLOSED_ALERTS_ENABLED_RUNTIME}
+"
+                        f"Live alerts: {GIANT_CANDLE_LIVE_ALERTS_ENABLED_RUNTIME}
+"
+                        f"Body threshold: {GIANT_CANDLE_BODY_PCT_RUNTIME:.4f}%
+"
+                        f"Range threshold: {GIANT_CANDLE_RANGE_PCT_RUNTIME:.4f}%
+"
+                        f"Use body: {GIANT_CANDLE_USE_BODY_RUNTIME}
+"
+                        f"Use range: {GIANT_CANDLE_USE_RANGE_RUNTIME}
+"
+                        f"Require direction: {GIANT_CANDLE_REQUIRE_SAME_COLOR_BODY_RUNTIME}"
+                    )
+
+                elif text == "/gianton":
+                    GIANT_CANDLE_ALERTS_ENABLED_RUNTIME = True
+                    send_private_alert("✅ Giant candle alerts enabled")
+
+                elif text == "/giantoff":
+                    GIANT_CANDLE_ALERTS_ENABLED_RUNTIME = False
+                    send_private_alert("⏸ Giant candle alerts disabled")
+
+                elif text == "/giantliveon":
+                    GIANT_CANDLE_LIVE_ALERTS_ENABLED_RUNTIME = True
+                    send_private_alert("✅ Giant candle LIVE alerts enabled")
+
+                elif text == "/giantliveoff":
+                    GIANT_CANDLE_LIVE_ALERTS_ENABLED_RUNTIME = False
+                    send_private_alert("⏸ Giant candle LIVE alerts disabled")
+
+                elif text == "/giantclosedon":
+                    GIANT_CANDLE_CLOSED_ALERTS_ENABLED_RUNTIME = True
+                    send_private_alert("✅ Giant candle CLOSED alerts enabled")
+
+                elif text == "/giantclosedoff":
+                    GIANT_CANDLE_CLOSED_ALERTS_ENABLED_RUNTIME = False
+                    send_private_alert("⏸ Giant candle CLOSED alerts disabled")
+
+                elif text.startswith("/setgiantbody "):
+                    try:
+                        value = float(text.split(maxsplit=1)[1].strip())
+                        if value < 0:
+                            raise Exception("Body threshold cannot be negative")
+                        GIANT_CANDLE_BODY_PCT_RUNTIME = value
+                        send_private_alert(f"✅ Giant candle body threshold updated to {GIANT_CANDLE_BODY_PCT_RUNTIME:.4f}%")
+                    except Exception as e:
+                        send_private_alert(f"❌ Failed to set giant candle body threshold
+{e}")
+
+                elif text.startswith("/setgiantrange "):
+                    try:
+                        value = float(text.split(maxsplit=1)[1].strip())
+                        if value < 0:
+                            raise Exception("Range threshold cannot be negative")
+                        GIANT_CANDLE_RANGE_PCT_RUNTIME = value
+                        send_private_alert(f"✅ Giant candle range threshold updated to {GIANT_CANDLE_RANGE_PCT_RUNTIME:.4f}%")
+                    except Exception as e:
+                        send_private_alert(f"❌ Failed to set giant candle range threshold
+{e}")
+
+                elif text == "/giantbodyon":
+                    GIANT_CANDLE_USE_BODY_RUNTIME = True
+                    send_private_alert("✅ Giant candle BODY filter enabled")
+
+                elif text == "/giantbodyoff":
+                    GIANT_CANDLE_USE_BODY_RUNTIME = False
+                    send_private_alert("⏸ Giant candle BODY filter disabled")
+
+                elif text == "/giantrangeon":
+                    GIANT_CANDLE_USE_RANGE_RUNTIME = True
+                    send_private_alert("✅ Giant candle RANGE filter enabled")
+
+                elif text == "/giantrangeoff":
+                    GIANT_CANDLE_USE_RANGE_RUNTIME = False
+                    send_private_alert("⏸ Giant candle RANGE filter disabled")
+
+                elif text == "/giantdirectionon":
+                    GIANT_CANDLE_REQUIRE_SAME_COLOR_BODY_RUNTIME = True
+                    send_private_alert("✅ Giant candle direction requirement enabled")
+
+                elif text == "/giantdirectionoff":
+                    GIANT_CANDLE_REQUIRE_SAME_COLOR_BODY_RUNTIME = False
+                    send_private_alert("⏸ Giant candle direction requirement disabled")
 
                 elif text == "/showpositions":
                     send_private_alert(get_positions_text())
@@ -2249,8 +2404,40 @@ def telegram_command_loop():
                         "/autooff - disable auto trading\n"
                         "/extremeon - enable extreme RSI alerts\n"
                         "/extremeoff - disable extreme RSI alerts\n"
-                        "/showstrategy - show auto strategy\n"
-                        "/showpositions - show tracked positions\n"
+                        "/showstrategy - show auto strategy
+"
+                        "/showgiant - show giant candle settings
+"
+                        "/gianton - enable giant candle alerts
+"
+                        "/giantoff - disable giant candle alerts
+"
+                        "/giantliveon - enable live giant candle alerts
+"
+                        "/giantliveoff - disable live giant candle alerts
+"
+                        "/giantclosedon - enable closed giant candle alerts
+"
+                        "/giantclosedoff - disable closed giant candle alerts
+"
+                        "/setgiantbody 1.2 - set giant candle body % threshold
+"
+                        "/setgiantrange 2.0 - set giant candle range % threshold
+"
+                        "/giantbodyon - enable body filter
+"
+                        "/giantbodyoff - disable body filter
+"
+                        "/giantrangeon - enable range filter
+"
+                        "/giantrangeoff - disable range filter
+"
+                        "/giantdirectionon - require bullish/bearish direction
+"
+                        "/giantdirectionoff - allow neutral candle body
+"
+                        "/showpositions - show tracked positions
+"
                         "/setrsibuy 15 - set buy threshold\n"
                         "/setrsisell 85 - set sell threshold\n"
                         "/setsl 0 - set stop loss percent (0 = OFF)\n"
@@ -2394,11 +2581,14 @@ def main():
     print("GROUP_SIGNAL_RSI_BUY =", GROUP_SIGNAL_RSI_BUY)
     print("GROUP_SIGNAL_RSI_SELL =", GROUP_SIGNAL_RSI_SELL)
     print("PRIVATE_EXTREME_SELL =", PRIVATE_EXTREME_SELL)
-    print("GIANT_CANDLE_ALERTS_ENABLED =", GIANT_CANDLE_ALERTS_ENABLED)
-    print("GIANT_CANDLE_CLOSED_ALERTS_ENABLED =", GIANT_CANDLE_CLOSED_ALERTS_ENABLED)
-    print("GIANT_CANDLE_LIVE_ALERTS_ENABLED =", GIANT_CANDLE_LIVE_ALERTS_ENABLED)
-    print("GIANT_CANDLE_BODY_PCT =", GIANT_CANDLE_BODY_PCT)
-    print("GIANT_CANDLE_RANGE_PCT =", GIANT_CANDLE_RANGE_PCT)
+    print("GIANT_CANDLE_ALERTS_ENABLED =", GIANT_CANDLE_ALERTS_ENABLED_RUNTIME)
+    print("GIANT_CANDLE_CLOSED_ALERTS_ENABLED =", GIANT_CANDLE_CLOSED_ALERTS_ENABLED_RUNTIME)
+    print("GIANT_CANDLE_LIVE_ALERTS_ENABLED =", GIANT_CANDLE_LIVE_ALERTS_ENABLED_RUNTIME)
+    print("GIANT_CANDLE_BODY_PCT =", GIANT_CANDLE_BODY_PCT_RUNTIME)
+    print("GIANT_CANDLE_RANGE_PCT =", GIANT_CANDLE_RANGE_PCT_RUNTIME)
+    print("GIANT_CANDLE_USE_BODY =", GIANT_CANDLE_USE_BODY_RUNTIME)
+    print("GIANT_CANDLE_USE_RANGE =", GIANT_CANDLE_USE_RANGE_RUNTIME)
+    print("GIANT_CANDLE_REQUIRE_SAME_COLOR_BODY =", GIANT_CANDLE_REQUIRE_SAME_COLOR_BODY_RUNTIME)
     print("TRADES_HISTORY_LIMIT =", TRADES_HISTORY_LIMIT)
     print("DAILY_REPORT_ENABLED =", DAILY_REPORT_ENABLED)
     print("DAILY_REPORT_HOUR =", DAILY_REPORT_HOUR)
