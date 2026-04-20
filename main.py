@@ -14,6 +14,7 @@ TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 GROUP_CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID", "").strip()
+GROUP_ALERTS_ENABLED = os.getenv("GROUP_ALERTS_ENABLED", "false").lower() == "true"
 
 CATEGORY = os.getenv("BYBIT_CATEGORY", "linear").strip().lower()
 TOP_N = int(os.getenv("TOP_N", "500"))
@@ -26,6 +27,18 @@ HEARTBEAT_TO_TELEGRAM = os.getenv("HEARTBEAT_TO_TELEGRAM", "true").lower() == "t
 WS_DEBUG = os.getenv("WS_DEBUG", "true").lower() == "true"
 
 TIMEFRAMES = ["5", "60"]
+
+# =========================
+# GIANT CANDLE DETECTOR
+# =========================
+GIANT_CANDLE_ALERTS_ENABLED = os.getenv("GIANT_CANDLE_ALERTS_ENABLED", "true").lower() == "true"
+GIANT_CANDLE_CLOSED_ALERTS_ENABLED = os.getenv("GIANT_CANDLE_CLOSED_ALERTS_ENABLED", "true").lower() == "true"
+GIANT_CANDLE_LIVE_ALERTS_ENABLED = os.getenv("GIANT_CANDLE_LIVE_ALERTS_ENABLED", "true").lower() == "true"
+GIANT_CANDLE_BODY_PCT = float(os.getenv("GIANT_CANDLE_BODY_PCT", "1.0"))
+GIANT_CANDLE_RANGE_PCT = float(os.getenv("GIANT_CANDLE_RANGE_PCT", "1.5"))
+GIANT_CANDLE_USE_BODY = os.getenv("GIANT_CANDLE_USE_BODY", "true").lower() == "true"
+GIANT_CANDLE_USE_RANGE = os.getenv("GIANT_CANDLE_USE_RANGE", "true").lower() == "true"
+GIANT_CANDLE_REQUIRE_SAME_COLOR_BODY = os.getenv("GIANT_CANDLE_REQUIRE_SAME_COLOR_BODY", "false").lower() == "true"
 
 # =========================
 # BYBIT MAINNET CONFIG
@@ -121,6 +134,7 @@ session = create_session()
 # GLOBALS
 # =========================
 data = {}
+candle_data = {}
 last_alert_candle = {}
 shortlist = set()
 live_symbols = set()
@@ -202,27 +216,20 @@ def send_private_alert(message: str):
 
 
 def send_group_alert(message: str):
+    if not GROUP_ALERTS_ENABLED:
+        return
     if GROUP_CHAT_ID:
         send_telegram_to_chat(GROUP_CHAT_ID, message)
 
 
 def send_telegram(message: str):
     """
-    Shared/system messages to both private chat and group.
-    Use this only for things you want BOTH places to see.
+    Default shared/system messages to private chat only.
+    Group delivery is disabled unless GROUP_ALERTS_ENABLED=true.
     """
-    seen = set()
-    targets = []
-    if CHAT_ID:
-        targets.append(CHAT_ID)
-    if GROUP_CHAT_ID:
-        targets.append(GROUP_CHAT_ID)
-
-    for target_chat_id in targets:
-        if target_chat_id in seen:
-            continue
-        seen.add(target_chat_id)
-        send_telegram_to_chat(target_chat_id, message)
+    send_private_alert(message)
+    if GROUP_ALERTS_ENABLED:
+        send_group_alert(message)
 
 
 def build_clean_signal_message(side: str, symbol: str, timeframe: str = "5") -> str:
@@ -245,12 +252,14 @@ def send_private_signal(side: str, symbol: str, timeframe: str = "5"):
 
 
 def send_group_signal(side: str, symbol: str, timeframe: str = "5"):
-    send_group_alert(build_clean_signal_message(side, symbol, timeframe))
+    if GROUP_ALERTS_ENABLED:
+        send_group_alert(build_clean_signal_message(side, symbol, timeframe))
 
 
 def send_private_and_group_signal(side: str, symbol: str, timeframe: str = "5"):
     send_private_signal(side, symbol, timeframe)
-    send_group_signal(side, symbol, timeframe)
+    if GROUP_ALERTS_ENABLED:
+        send_group_signal(side, symbol, timeframe)
 
 
 def get_telegram_updates(offset=None, timeout=20):
@@ -280,7 +289,6 @@ def heartbeat():
     while True:
         print("BOT ALIVE ✅")
         if HEARTBEAT_TO_TELEGRAM:
-            # PRIVATE ONLY
             send_private_alert("BOT ALIVE ✅")
         time.sleep(HEARTBEAT_SECONDS)
 
@@ -314,6 +322,8 @@ def normalize_interval(interval_value):
 def ensure_symbol_state(symbol: str):
     if symbol not in data:
         data[symbol] = {}
+    if symbol not in candle_data:
+        candle_data[symbol] = {}
     if symbol not in current_candle_start:
         current_candle_start[symbol] = {}
     if symbol not in last_closed_candle_start:
@@ -322,6 +332,8 @@ def ensure_symbol_state(symbol: str):
     for tf in TIMEFRAMES:
         if tf not in data[symbol]:
             data[symbol][tf] = []
+        if tf not in candle_data[symbol]:
+            candle_data[symbol][tf] = []
 
 
 def deep_merge(base: dict, override: dict) -> dict:
@@ -401,6 +413,112 @@ def ts_to_text(ts: int) -> str:
 def today_str_from_ts(ts: int) -> str:
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
 
+
+def fmt_candle_dir(open_price: float, close_price: float) -> str:
+    if close_price > open_price:
+        return "BULLISH"
+    if close_price < open_price:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def build_candle_snapshot(start_time: int, open_price: float, high_price: float, low_price: float, close_price: float, confirm: bool):
+    return {
+        "start": int(start_time),
+        "open": float(open_price),
+        "high": float(high_price),
+        "low": float(low_price),
+        "close": float(close_price),
+        "confirm": bool(confirm),
+    }
+
+
+def get_candle_metrics(candle: dict):
+    if not candle:
+        return None
+
+    open_price = safe_float(candle.get("open"))
+    high_price = safe_float(candle.get("high"))
+    low_price = safe_float(candle.get("low"))
+    close_price = safe_float(candle.get("close"))
+
+    if open_price is None or open_price <= 0:
+        return None
+    if high_price is None or low_price is None or close_price is None:
+        return None
+
+    body_pct = abs((close_price - open_price) / open_price) * 100.0
+    range_pct = abs((high_price - low_price) / open_price) * 100.0
+    direction = fmt_candle_dir(open_price, close_price)
+
+    return {
+        "body_pct": body_pct,
+        "range_pct": range_pct,
+        "direction": direction,
+        "open": open_price,
+        "high": high_price,
+        "low": low_price,
+        "close": close_price,
+    }
+
+
+def giant_candle_match(candle: dict) -> bool:
+    metrics = get_candle_metrics(candle)
+    if not metrics:
+        return False
+
+    body_ok = (not GIANT_CANDLE_USE_BODY) or (metrics["body_pct"] >= GIANT_CANDLE_BODY_PCT)
+    range_ok = (not GIANT_CANDLE_USE_RANGE) or (metrics["range_pct"] >= GIANT_CANDLE_RANGE_PCT)
+
+    if GIANT_CANDLE_REQUIRE_SAME_COLOR_BODY and metrics["direction"] == "NEUTRAL":
+        return False
+
+    return body_ok and range_ok
+
+
+def build_giant_candle_message(symbol: str, tf: str, candle: dict, live_mode: bool) -> str:
+    metrics = get_candle_metrics(candle)
+    status = "LIVE GIANT CANDLE" if live_mode else "CLOSED GIANT CANDLE"
+    icon = "🟡" if live_mode else "🟠"
+
+    return (
+        f"{icon} {status}\n"
+        f"Symbol: {symbol}\n"
+        f"Timeframe: {tf}\n"
+        f"Candle start: {ts_to_text(int(candle['start']) / 1000 if int(candle['start']) > 9999999999 else int(candle['start']))}\n"
+        f"Direction: {metrics['direction']}\n"
+        f"Open: {metrics['open']:.8f}\n"
+        f"High: {metrics['high']:.8f}\n"
+        f"Low: {metrics['low']:.8f}\n"
+        f"Close: {metrics['close']:.8f}\n"
+        f"Body %: {metrics['body_pct']:.4f}%\n"
+        f"Range %: {metrics['range_pct']:.4f}%\n"
+        f"Body threshold: {GIANT_CANDLE_BODY_PCT:.4f}%\n"
+        f"Range threshold: {GIANT_CANDLE_RANGE_PCT:.4f}%"
+    )
+
+
+def process_giant_candle_alerts(symbol: str, tf: str, candle: dict):
+    if not GIANT_CANDLE_ALERTS_ENABLED:
+        return
+
+    if not giant_candle_match(candle):
+        return
+
+    candle_start = safe_int(candle.get("start"))
+    if candle_start is None:
+        return
+
+    is_confirmed = bool(candle.get("confirm", False))
+
+    if is_confirmed and GIANT_CANDLE_CLOSED_ALERTS_ENABLED:
+        if should_alert_once_per_candle("giant_candle_closed", symbol, tf, candle_start):
+            send_private_alert(build_giant_candle_message(symbol, tf, candle, live_mode=False))
+
+    if (not is_confirmed) and GIANT_CANDLE_LIVE_ALERTS_ENABLED:
+        if should_alert_once_per_candle("giant_candle_live", symbol, tf, candle_start):
+            send_private_alert(build_giant_candle_message(symbol, tf, candle, live_mode=True))
+
 # =========================
 # INDICATORS
 # =========================
@@ -434,7 +552,6 @@ def process_extreme_rsi_alerts(symbol: str, tf: str, candle_start: int, rsi_valu
     if not EXTREME_ALERTS_ENABLED:
         return
 
-    # Private-only very low RSI alert
     if rsi_value <= PRIVATE_RSI_VERY_LOW:
         if should_alert_once_per_candle("private_rsi_very_low", symbol, tf, candle_start):
             send_private_alert(
@@ -445,7 +562,6 @@ def process_extreme_rsi_alerts(symbol: str, tf: str, candle_start: int, rsi_valu
                 f"Threshold: {PRIVATE_RSI_VERY_LOW:.2f}"
             )
 
-    # Private-only very high RSI alert
     if rsi_value >= PRIVATE_RSI_VERY_HIGH:
         if should_alert_once_per_candle("private_rsi_very_high", symbol, tf, candle_start):
             send_private_alert(
@@ -456,7 +572,6 @@ def process_extreme_rsi_alerts(symbol: str, tf: str, candle_start: int, rsi_valu
                 f"Threshold: {PRIVATE_RSI_VERY_HIGH:.2f}"
             )
 
-    # BUY NOW to private + group when RSI <= 7
     if rsi_value <= GROUP_SIGNAL_RSI_BUY:
         if should_alert_once_per_candle("clean_buy_signal", symbol, tf, candle_start):
             send_private_alert(
@@ -468,7 +583,6 @@ def process_extreme_rsi_alerts(symbol: str, tf: str, candle_start: int, rsi_valu
             )
             send_private_and_group_signal("BUY", symbol, tf)
 
-    # SELL NOW to private + group when RSI >= 93
     if rsi_value >= GROUP_SIGNAL_RSI_SELL:
         if should_alert_once_per_candle("clean_sell_signal", symbol, tf, candle_start):
             if rsi_value >= PRIVATE_EXTREME_SELL:
@@ -919,11 +1033,17 @@ def get_strategy_text():
         f"Buy rule: 5m RSI <= {RSI_BUY_THRESHOLD:.2f}\n"
         f"Sell rule: 5m RSI >= {RSI_SELL_THRESHOLD:.2f} OR SL/TP/Trailing\n"
         f"Extreme alerts enabled: {EXTREME_ALERTS_ENABLED}\n"
+        f"Giant candle alerts enabled: {GIANT_CANDLE_ALERTS_ENABLED}\n"
+        f"Giant candle closed alerts: {GIANT_CANDLE_CLOSED_ALERTS_ENABLED}\n"
+        f"Giant candle live alerts: {GIANT_CANDLE_LIVE_ALERTS_ENABLED}\n"
+        f"Giant candle body threshold: {GIANT_CANDLE_BODY_PCT:.4f}%\n"
+        f"Giant candle range threshold: {GIANT_CANDLE_RANGE_PCT:.4f}%\n"
         f"Private RSI very low <= {PRIVATE_RSI_VERY_LOW:.2f}\n"
         f"Private RSI very high >= {PRIVATE_RSI_VERY_HIGH:.2f}\n"
         f"Group signal BUY <= {GROUP_SIGNAL_RSI_BUY:.2f}\n"
         f"Group signal SELL >= {GROUP_SIGNAL_RSI_SELL:.2f}\n"
         f"Private extreme SELL >= {PRIVATE_EXTREME_SELL:.2f}\n"
+        f"Group alerts enabled: {GROUP_ALERTS_ENABLED}\n"
         f"Stop loss: {pct_text(STOP_LOSS_PCT)}\n"
         f"Take profit: {pct_text(TAKE_PROFIT_PCT)}\n"
         f"Trailing stop: {pct_text(TRAILING_STOP_PCT)}\n"
@@ -1079,18 +1199,35 @@ def fetch_history(symbol: str, tf: str):
 
         rows.reverse()
         closes = []
+        candles = []
 
         for row in rows:
             if len(row) < 5:
                 continue
-            close = safe_float(row[4])
-            if close is None:
+
+            start_time = safe_int(row[0])
+            open_price = safe_float(row[1])
+            high_price = safe_float(row[2])
+            low_price = safe_float(row[3])
+            close_price = safe_float(row[4])
+
+            if close_price is None:
                 continue
-            closes.append(close)
+
+            closes.append(close_price)
+
+            if None not in (start_time, open_price, high_price, low_price, close_price):
+                candles.append(build_candle_snapshot(start_time, open_price, high_price, low_price, close_price, True))
 
         if closes:
-            data[symbol][tf] = closes
-            print(f"Loaded history: {symbol} {tf} candles={len(closes)}")
+            data[symbol][tf] = closes[-HISTORY_LIMIT:]
+        if candles:
+            candle_data[symbol][tf] = candles[-HISTORY_LIMIT:]
+            last_closed = candles[-1]
+            last_closed_candle_start[symbol][tf] = safe_int(last_closed["start"])
+            current_candle_start[symbol][tf] = safe_int(last_closed["start"])
+
+        print(f"Loaded history: {symbol} {tf} candles={len(closes)}")
 
     except Exception as e:
         print(f"History fetch error {symbol} {tf}: {e}")
@@ -1167,7 +1304,6 @@ def process_indicators(symbol: str, tf: str, candle_start: int):
             overbought = float(rsi_cfg.get("overbought", 70))
             oversold = float(rsi_cfg.get("oversold", 30))
 
-            # Raw alerts to private bot only
             if r >= overbought:
                 if should_alert_once_per_candle("rsi_overbought", symbol, tf, candle_start):
                     send_private_alert(
@@ -1229,6 +1365,9 @@ def handle_kline(msg):
 
             symbol = str(item.get("symbol") or topic_symbol or "").upper()
             interval = normalize_interval(item.get("interval") or topic_interval or "")
+            open_price = safe_float(item.get("open"))
+            high_price = safe_float(item.get("high"))
+            low_price = safe_float(item.get("low"))
             close = safe_float(item.get("close"))
             start_time = safe_int(item.get("start"))
             confirm = bool(item.get("confirm", False))
@@ -1242,25 +1381,47 @@ def handle_kline(msg):
             if interval not in TIMEFRAMES:
                 continue
 
+            if None in (open_price, high_price, low_price):
+                continue
+
             ensure_symbol_state(symbol)
             arr = data[symbol][interval]
+            candles = candle_data[symbol][interval]
 
             previous_start = current_candle_start[symbol].get(interval)
             new_candle_started = previous_start is None or start_time != previous_start
 
+            current_snapshot = build_candle_snapshot(
+                start_time,
+                open_price,
+                high_price,
+                low_price,
+                close,
+                confirm,
+            )
+
             if new_candle_started:
                 current_candle_start[symbol][interval] = start_time
                 arr.append(close)
+                candles.append(current_snapshot)
 
                 if len(arr) > HISTORY_LIMIT:
                     arr.pop(0)
+                if len(candles) > HISTORY_LIMIT:
+                    candles.pop(0)
             else:
                 if not arr:
                     arr.append(close)
                 else:
                     arr[-1] = close
 
+                if not candles:
+                    candles.append(current_snapshot)
+                else:
+                    candles[-1] = current_snapshot
+
             process_indicators(symbol, interval, start_time)
+            process_giant_candle_alerts(symbol, interval, current_snapshot)
 
             if confirm:
                 last_closed_candle_start[symbol][interval] = start_time
@@ -1543,7 +1704,6 @@ def auto_entry_loop():
                                 f"\nTrailing stop: {ts_text}"
                             )
 
-                    # PRIVATE ONLY
                     send_private_alert(msg)
                     time.sleep(1.0)
                 except Exception as e:
@@ -1682,10 +1842,16 @@ def get_status_text():
         f"Live symbols: {len(live)}\n"
         f"History limit: {HISTORY_LIMIT}\n"
         f"Telegram enabled: {TELEGRAM_ENABLED}\n"
+        f"Group alerts enabled: {GROUP_ALERTS_ENABLED}\n"
         f"Bybit trading enabled: {BYBIT_TRADING_ENABLED}\n"
         f"Bybit keys loaded: {bybit_keys_ready()}\n"
         f"Auto trading enabled: {AUTO_TRADING_ENABLED}\n"
         f"Extreme alerts enabled: {EXTREME_ALERTS_ENABLED}\n"
+        f"Giant candle alerts enabled: {GIANT_CANDLE_ALERTS_ENABLED}\n"
+        f"Giant candle closed alerts enabled: {GIANT_CANDLE_CLOSED_ALERTS_ENABLED}\n"
+        f"Giant candle live alerts enabled: {GIANT_CANDLE_LIVE_ALERTS_ENABLED}\n"
+        f"Giant candle body threshold: {GIANT_CANDLE_BODY_PCT:.4f}%\n"
+        f"Giant candle range threshold: {GIANT_CANDLE_RANGE_PCT:.4f}%\n"
         f"Daily report enabled: {DAILY_REPORT_ENABLED}\n"
         f"Current open positions: {get_open_positions_count()}\n"
         f"Max open positions: {MAX_OPEN_POSITIONS}\n"
@@ -1739,6 +1905,12 @@ def get_diag_text():
         f"BYBIT_KEYS_READY: {bybit_keys_ready()}\n"
         f"AUTO_TRADING_ENABLED: {AUTO_TRADING_ENABLED}\n"
         f"EXTREME_ALERTS_ENABLED: {EXTREME_ALERTS_ENABLED}\n"
+        f"GIANT_CANDLE_ALERTS_ENABLED: {GIANT_CANDLE_ALERTS_ENABLED}\n"
+        f"GIANT_CANDLE_CLOSED_ALERTS_ENABLED: {GIANT_CANDLE_CLOSED_ALERTS_ENABLED}\n"
+        f"GIANT_CANDLE_LIVE_ALERTS_ENABLED: {GIANT_CANDLE_LIVE_ALERTS_ENABLED}\n"
+        f"GIANT_CANDLE_BODY_PCT: {GIANT_CANDLE_BODY_PCT}\n"
+        f"GIANT_CANDLE_RANGE_PCT: {GIANT_CANDLE_RANGE_PCT}\n"
+        f"GROUP_ALERTS_ENABLED: {GROUP_ALERTS_ENABLED}\n"
         f"DAILY_REPORT_ENABLED: {DAILY_REPORT_ENABLED}\n"
         f"RSI_BUY_THRESHOLD: {RSI_BUY_THRESHOLD}\n"
         f"RSI_SELL_THRESHOLD: {RSI_SELL_THRESHOLD}\n"
@@ -1806,7 +1978,10 @@ def telegram_command_loop():
                     send_private_alert("✅ Telegram private command test OK")
 
                 elif text == "/testgroup":
-                    send_group_signal("BUY", "BTCUSDT", "5")
+                    if GROUP_ALERTS_ENABLED:
+                        send_group_signal("BUY", "BTCUSDT", "5")
+                    else:
+                        send_private_alert("ℹ️ Group alerts are disabled (GROUP_ALERTS_ENABLED=false)")
 
                 elif text == "/force":
                     force_test_alerts()
@@ -2055,10 +2230,10 @@ def telegram_command_loop():
                     send_private_alert(
                         "Available commands:\n"
                         "/test - private test\n"
-                        "/testgroup - test clean signal to group only\n"
+                        "/testgroup - test group signal if GROUP_ALERTS_ENABLED=true\n"
                         "/force - force fake raw alert to private chat\n"
-                        "/forcesignalbuy - force clean BUY signal to private + group\n"
-                        "/forcesignalsell - force clean SELL signal to private + group\n"
+                        "/forcesignalbuy - force clean BUY signal\n"
+                        "/forcesignalsell - force clean SELL signal\n"
                         "/status - bot status\n"
                         "/symbols - live symbol sample\n"
                         "/diag - websocket diagnostics\n"
@@ -2107,7 +2282,6 @@ def daily_report_loop():
                 now = datetime.now()
                 current_date = now.strftime("%Y-%m-%d")
                 if now.hour == DAILY_REPORT_HOUR and last_daily_report_date != current_date:
-                    # PRIVATE ONLY
                     send_private_alert(get_pnl_text(day_filter=current_date))
                     last_daily_report_date = current_date
         except Exception as e:
@@ -2197,6 +2371,7 @@ def main():
     print("BOT_TOKEN set =", bool(BOT_TOKEN))
     print("CHAT_ID set =", bool(CHAT_ID))
     print("GROUP_CHAT_ID set =", bool(GROUP_CHAT_ID))
+    print("GROUP_ALERTS_ENABLED =", GROUP_ALERTS_ENABLED)
     print("CATEGORY =", CATEGORY)
     print("TOP_N =", TOP_N)
     print("LIVE_WS_SYMBOLS =", LIVE_WS_SYMBOLS)
@@ -2219,12 +2394,16 @@ def main():
     print("GROUP_SIGNAL_RSI_BUY =", GROUP_SIGNAL_RSI_BUY)
     print("GROUP_SIGNAL_RSI_SELL =", GROUP_SIGNAL_RSI_SELL)
     print("PRIVATE_EXTREME_SELL =", PRIVATE_EXTREME_SELL)
+    print("GIANT_CANDLE_ALERTS_ENABLED =", GIANT_CANDLE_ALERTS_ENABLED)
+    print("GIANT_CANDLE_CLOSED_ALERTS_ENABLED =", GIANT_CANDLE_CLOSED_ALERTS_ENABLED)
+    print("GIANT_CANDLE_LIVE_ALERTS_ENABLED =", GIANT_CANDLE_LIVE_ALERTS_ENABLED)
+    print("GIANT_CANDLE_BODY_PCT =", GIANT_CANDLE_BODY_PCT)
+    print("GIANT_CANDLE_RANGE_PCT =", GIANT_CANDLE_RANGE_PCT)
     print("TRADES_HISTORY_LIMIT =", TRADES_HISTORY_LIMIT)
     print("DAILY_REPORT_ENABLED =", DAILY_REPORT_ENABLED)
     print("DAILY_REPORT_HOUR =", DAILY_REPORT_HOUR)
     print("DEFAULT_MAX_OPEN_POSITIONS =", DEFAULT_MAX_OPEN_POSITIONS)
 
-    # PRIVATE ONLY
     send_private_alert("🚀 Scanner started")
     send_private_alert("✅ Telegram private test message")
 
