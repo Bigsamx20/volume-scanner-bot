@@ -48,6 +48,9 @@ DEFAULT_STOP_LOSS_PCT = float(os.getenv("DEFAULT_STOP_LOSS_PCT", "2.0"))
 DEFAULT_TAKE_PROFIT_PCT = float(os.getenv("DEFAULT_TAKE_PROFIT_PCT", "3.0"))
 DEFAULT_TRAILING_STOP_PCT = float(os.getenv("DEFAULT_TRAILING_STOP_PCT", "0"))
 DEFAULT_TRAILING_START_PCT = float(os.getenv("DEFAULT_TRAILING_START_PCT", "0"))
+DEFAULT_BREAK_EVEN_ENABLED = os.getenv("DEFAULT_BREAK_EVEN_ENABLED", "true").lower() == "true"
+DEFAULT_BREAK_EVEN_TRIGGER_PCT = float(os.getenv("DEFAULT_BREAK_EVEN_TRIGGER_PCT", "0"))
+DEFAULT_BREAK_EVEN_OFFSET_PCT = float(os.getenv("DEFAULT_BREAK_EVEN_OFFSET_PCT", "0"))
 DEFAULT_RSI_BUY = float(os.getenv("DEFAULT_RSI_BUY", "5"))
 DEFAULT_RSI_SELL = float(os.getenv("DEFAULT_RSI_SELL", "95"))
 DEFAULT_MAX_OPEN_POSITIONS = int(os.getenv("DEFAULT_MAX_OPEN_POSITIONS", "5"))
@@ -112,6 +115,9 @@ STOP_LOSS_PCT = DEFAULT_STOP_LOSS_PCT
 TAKE_PROFIT_PCT = DEFAULT_TAKE_PROFIT_PCT
 TRAILING_STOP_PCT = DEFAULT_TRAILING_STOP_PCT
 TRAILING_START_PCT = DEFAULT_TRAILING_START_PCT
+BREAK_EVEN_ENABLED = DEFAULT_BREAK_EVEN_ENABLED
+BREAK_EVEN_TRIGGER_PCT = DEFAULT_BREAK_EVEN_TRIGGER_PCT
+BREAK_EVEN_OFFSET_PCT = DEFAULT_BREAK_EVEN_OFFSET_PCT
 RSI_BUY_THRESHOLD = DEFAULT_RSI_BUY
 RSI_SELL_THRESHOLD = DEFAULT_RSI_SELL
 MAX_OPEN_POSITIONS = DEFAULT_MAX_OPEN_POSITIONS
@@ -514,9 +520,34 @@ def trailing_should_be_active(entry_price: float, highest_price: float) -> bool:
         return True
     return highest_price >= entry_price * (1 + TRAILING_START_PCT / 100.0)
 
+def break_even_should_be_active(entry_price: float, highest_price: float) -> bool:
+    if not BREAK_EVEN_ENABLED:
+        return False
+    if highest_price is None or entry_price <= 0:
+        return False
+    trigger_price = entry_price * (1 + BREAK_EVEN_TRIGGER_PCT / 100.0)
+    return highest_price >= trigger_price
+
+def compute_break_even_stop_price(entry_price: float) -> float:
+    return entry_price * (1 + BREAK_EVEN_OFFSET_PCT / 100.0)
+
+def apply_break_even_to_stop_loss(pos: dict):
+    if not pos.get("break_even_active"):
+        return
+    be_price = pos.get("break_even_stop_price")
+    if be_price is None:
+        return
+    current_sl = pos.get("stop_loss_price")
+    if current_sl is None or be_price > current_sl:
+        pos["stop_loss_price"] = be_price
+
 def set_position(symbol: str, entry_price: float, quantity: float, source: str):
     sl, tp = compute_risk_prices(entry_price)
     trailing_active = trailing_should_be_active(entry_price, entry_price)
+    break_even_active = break_even_should_be_active(entry_price, entry_price)
+    break_even_stop_price = compute_break_even_stop_price(entry_price) if break_even_active else None
+    if break_even_active and (sl is None or break_even_stop_price > sl):
+        sl = break_even_stop_price
     with positions_lock:
         positions[symbol] = {
             "symbol": symbol,
@@ -527,6 +558,8 @@ def set_position(symbol: str, entry_price: float, quantity: float, source: str):
             "highest_price": entry_price,
             "trailing_stop_price": compute_trailing_stop_price(entry_price) if trailing_active else None,
             "trailing_active": trailing_active,
+            "break_even_active": break_even_active,
+            "break_even_stop_price": break_even_stop_price,
             "source": source,
             "opened_at": int(time.time()),
         }
@@ -576,6 +609,10 @@ def refresh_all_position_risk_levels():
             pos["stop_loss_price"] = sl
             pos["take_profit_price"] = tp
             highest = pos.get("highest_price")
+            be_active = break_even_should_be_active(entry, highest)
+            pos["break_even_active"] = be_active
+            pos["break_even_stop_price"] = compute_break_even_stop_price(entry) if be_active else None
+            apply_break_even_to_stop_loss(pos)
             active = trailing_should_be_active(entry, highest)
             pos["trailing_active"] = active
             pos["trailing_stop_price"] = compute_trailing_stop_price(highest) if active else None
@@ -587,6 +624,11 @@ def update_position_high_water(symbol: str, current_price: float):
             return
         if pos.get("highest_price") is None or current_price > pos.get("highest_price"):
             pos["highest_price"] = current_price
+        be_active = break_even_should_be_active(pos["entry_price"], pos["highest_price"])
+        pos["break_even_active"] = be_active
+        pos["break_even_stop_price"] = compute_break_even_stop_price(pos["entry_price"]) if be_active else None
+        apply_break_even_to_stop_loss(pos)
+
         active = trailing_should_be_active(pos["entry_price"], pos["highest_price"])
         pos["trailing_active"] = active
         pos["trailing_stop_price"] = compute_trailing_stop_price(pos["highest_price"]) if active else None
@@ -602,7 +644,9 @@ def get_positions_text():
             ts = "OFF" if pos.get("trailing_stop_price") is None else f"{pos['trailing_stop_price']:.8f}"
             hp = "N/A" if pos.get("highest_price") is None else f"{pos['highest_price']:.8f}"
             ta = "ON" if pos.get("trailing_active") else "OFF"
-            lines.append(f"{symbol} | entry={pos['entry_price']:.8f} | qty={pos['quantity']} | sl={sl} | tp={tp} | high={hp} | tsl={ts} | ta={ta}")
+            be = "ON" if pos.get("break_even_active") else "OFF"
+            be_price = "OFF" if pos.get("break_even_stop_price") is None else f"{pos['break_even_stop_price']:.8f}"
+            lines.append(f"{symbol} | entry={pos['entry_price']:.8f} | qty={pos['quantity']} | sl={sl} | tp={tp} | high={hp} | tsl={ts} | ta={ta} | be={be} | be_stop={be_price}")
         return "\n".join(lines[:30])
 
 def get_strategy_text():
@@ -614,7 +658,7 @@ def get_strategy_text():
         f"RSI Alert 2: buy <= {ALERT2_RSI_BUY:.2f} | sell >= {ALERT2_RSI_SELL:.2f} (bot only)\n"
         f"RSI Alert 3: buy <= {ALERT3_RSI_BUY:.2f} | sell >= {ALERT3_RSI_SELL:.2f} (bot + group)\n"
         f"Stop loss: {pct_text(STOP_LOSS_PCT)}\nTake profit: {pct_text(TAKE_PROFIT_PCT)}\nTrailing stop: {pct_text(TRAILING_STOP_PCT)}\n"
-        f"Trailing activation: {pct_text(TRAILING_START_PCT)}\nMax open positions: {MAX_OPEN_POSITIONS}\nSymbol cooldown: {SYMBOL_COOLDOWN_SECONDS}s\n"
+        f"Trailing activation: {pct_text(TRAILING_START_PCT)}\nBreak-even stop: {BREAK_EVEN_ENABLED}\nBreak-even trigger: {pct_text(BREAK_EVEN_TRIGGER_PCT)}\nBreak-even offset: {pct_text(BREAK_EVEN_OFFSET_PCT)}\nMax open positions: {MAX_OPEN_POSITIONS}\nSymbol cooldown: {SYMBOL_COOLDOWN_SECONDS}s\n"
         f"Trade size (margin): {TRADE_SIZE_USDT:.4f} USDT\nLeverage: {LEVERAGE}x\nApprox position notional/trade: {(TRADE_SIZE_USDT * LEVERAGE):.4f} USDT\n"
         f"Daily report enabled: {DAILY_REPORT_ENABLED}\nDaily report hour: {DAILY_REPORT_HOUR}\nCurrent open positions: {get_open_positions_count()}"
     )
@@ -1137,7 +1181,7 @@ def get_diag_text():
         f"DAILY_REPORT_ENABLED: {DAILY_REPORT_ENABLED}\nRSI_BUY_THRESHOLD: {RSI_BUY_THRESHOLD}\nRSI_SELL_THRESHOLD: {RSI_SELL_THRESHOLD}\n"
         f"ALERT1_RSI_BUY: {ALERT1_RSI_BUY}\nALERT1_RSI_SELL: {ALERT1_RSI_SELL}\nALERT2_RSI_BUY: {ALERT2_RSI_BUY}\nALERT2_RSI_SELL: {ALERT2_RSI_SELL}\n"
         f"ALERT3_RSI_BUY: {ALERT3_RSI_BUY}\nALERT3_RSI_SELL: {ALERT3_RSI_SELL}\nSTOP_LOSS_PCT: {STOP_LOSS_PCT}\nTAKE_PROFIT_PCT: {TAKE_PROFIT_PCT}\n"
-        f"TRAILING_STOP_PCT: {TRAILING_STOP_PCT}\nTRAILING_START_PCT: {TRAILING_START_PCT}\nMAX_OPEN_POSITIONS: {MAX_OPEN_POSITIONS}\nTRADE_SIZE_USDT: {TRADE_SIZE_USDT}\n"
+        f"TRAILING_STOP_PCT: {TRAILING_STOP_PCT}\nTRAILING_START_PCT: {TRAILING_START_PCT}\nBREAK_EVEN_ENABLED: {BREAK_EVEN_ENABLED}\nBREAK_EVEN_TRIGGER_PCT: {BREAK_EVEN_TRIGGER_PCT}\nBREAK_EVEN_OFFSET_PCT: {BREAK_EVEN_OFFSET_PCT}\nMAX_OPEN_POSITIONS: {MAX_OPEN_POSITIONS}\nTRADE_SIZE_USDT: {TRADE_SIZE_USDT}\n"
         f"LEVERAGE: {LEVERAGE}\nCLOSED_TRADES_COUNT: {trades_count}\nSUPPORTED_BYBIT_USDT_SYMBOLS: {bybit_count}\nTELEGRAM_QUEUE_SIZE: {telegram_queue.qsize()}"
     )
 
@@ -1157,6 +1201,7 @@ def telegram_help_text():
 def telegram_command_loop():
     global telegram_offset, last_command_time
     global AUTO_TRADING_ENABLED, STOP_LOSS_PCT, TAKE_PROFIT_PCT, TRAILING_STOP_PCT, TRAILING_START_PCT
+    global BREAK_EVEN_ENABLED, BREAK_EVEN_TRIGGER_PCT, BREAK_EVEN_OFFSET_PCT
     global RSI_BUY_THRESHOLD, RSI_SELL_THRESHOLD, MAX_OPEN_POSITIONS, SYMBOL_COOLDOWN_SECONDS, TRADE_SIZE_USDT, LEVERAGE
     if not TELEGRAM_ENABLED:
         print("Telegram command loop disabled")
@@ -1329,6 +1374,54 @@ def telegram_command_loop():
                         send_telegram(f"✅ Trailing activation updated\nStop loss: {pct_text(STOP_LOSS_PCT)}\nTake profit: {pct_text(TAKE_PROFIT_PCT)}\nTrailing stop: {pct_text(TRAILING_STOP_PCT)}\nTrail start: {pct_text(TRAILING_START_PCT)}")
                     except Exception as e:
                         send_telegram(f"❌ Failed to set trailing activation\n{e}")
+                elif text.startswith("/setbe "):
+                    try:
+                        value = text.split(maxsplit=1)[1].strip().lower()
+                        if value in ("on", "true", "1", "yes"):
+                            BREAK_EVEN_ENABLED = True
+                        elif value in ("off", "false", "0", "no"):
+                            BREAK_EVEN_ENABLED = False
+                        else:
+                            raise Exception("Use /setbe on or /setbe off")
+                        refresh_all_position_risk_levels()
+                        send_telegram(
+                            f"✅ Break-even stop updated\n"
+                            f"Break-even stop: {BREAK_EVEN_ENABLED}\n"
+                            f"Trigger: {pct_text(BREAK_EVEN_TRIGGER_PCT)}\n"
+                            f"Offset: {pct_text(BREAK_EVEN_OFFSET_PCT)}"
+                        )
+                    except Exception as e:
+                        send_telegram(f"❌ Failed to set break-even stop\n{e}")
+                elif text.startswith("/setbetrigger "):
+                    try:
+                        value = float(text.split(maxsplit=1)[1].strip())
+                        if value < 0:
+                            raise Exception("Break-even trigger cannot be negative")
+                        BREAK_EVEN_TRIGGER_PCT = value
+                        refresh_all_position_risk_levels()
+                        send_telegram(
+                            f"✅ Break-even trigger updated\n"
+                            f"Break-even stop: {BREAK_EVEN_ENABLED}\n"
+                            f"Trigger: {pct_text(BREAK_EVEN_TRIGGER_PCT)}\n"
+                            f"Offset: {pct_text(BREAK_EVEN_OFFSET_PCT)}"
+                        )
+                    except Exception as e:
+                        send_telegram(f"❌ Failed to set break-even trigger\n{e}")
+                elif text.startswith("/setbeoffset "):
+                    try:
+                        value = float(text.split(maxsplit=1)[1].strip())
+                        if value < 0:
+                            raise Exception("Break-even offset cannot be negative")
+                        BREAK_EVEN_OFFSET_PCT = value
+                        refresh_all_position_risk_levels()
+                        send_telegram(
+                            f"✅ Break-even offset updated\n"
+                            f"Break-even stop: {BREAK_EVEN_ENABLED}\n"
+                            f"Trigger: {pct_text(BREAK_EVEN_TRIGGER_PCT)}\n"
+                            f"Offset: {pct_text(BREAK_EVEN_OFFSET_PCT)}"
+                        )
+                    except Exception as e:
+                        send_telegram(f"❌ Failed to set break-even offset\n{e}")
                 elif text.startswith("/setmaxcoins "):
                     try:
                         value = int(text.split(maxsplit=1)[1].strip())
@@ -1463,6 +1556,9 @@ def main():
     print("DEFAULT_TAKE_PROFIT_PCT =", DEFAULT_TAKE_PROFIT_PCT)
     print("DEFAULT_TRAILING_STOP_PCT =", DEFAULT_TRAILING_STOP_PCT)
     print("DEFAULT_TRAILING_START_PCT =", DEFAULT_TRAILING_START_PCT)
+    print("DEFAULT_BREAK_EVEN_ENABLED =", DEFAULT_BREAK_EVEN_ENABLED)
+    print("DEFAULT_BREAK_EVEN_TRIGGER_PCT =", DEFAULT_BREAK_EVEN_TRIGGER_PCT)
+    print("DEFAULT_BREAK_EVEN_OFFSET_PCT =", DEFAULT_BREAK_EVEN_OFFSET_PCT)
     print("DEFAULT_RSI_BUY =", DEFAULT_RSI_BUY)
     print("DEFAULT_RSI_SELL =", DEFAULT_RSI_SELL)
     print("ALERT1_RSI_BUY =", ALERT1_RSI_BUY)
