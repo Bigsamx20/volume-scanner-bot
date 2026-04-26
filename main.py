@@ -71,16 +71,18 @@ SEND_ALERT2_TO_GROUP = os.getenv("SEND_ALERT2_TO_GROUP", "false").lower() == "tr
 SEND_ALERT3_TO_GROUP = os.getenv("SEND_ALERT3_TO_GROUP", "true").lower() == "true"
 
 # =========================================================
-# BOLLINGER BAND CONFIG
+# CUSTOMIZABLE BOLLINGER BAND ALERT SETUP
 # =========================================================
 BB_ALERTS_ENABLED = os.getenv("BB_ALERTS_ENABLED", "true").lower() == "true"
+BB_CLOSE_ALERT_ENABLED = os.getenv("BB_CLOSE_ALERT_ENABLED", "true").lower() == "true"
+BB_WIDE_ALERT_ENABLED = os.getenv("BB_WIDE_ALERT_ENABLED", "true").lower() == "true"
 BB_LENGTH = int(os.getenv("BB_LENGTH", "20"))
 BB_STD_MULT = float(os.getenv("BB_STD_MULT", "2"))
-BB_SQUEEZE_WIDTH_PCT = float(os.getenv("BB_SQUEEZE_WIDTH_PCT", "1.5"))
-BB_EXPANSION_WIDTH_PCT = float(os.getenv("BB_EXPANSION_WIDTH_PCT", "4.0"))
+BB_CLOSE_WIDTH_PCT = float(os.getenv("BB_CLOSE_WIDTH_PCT", os.getenv("BB_SQUEEZE_WIDTH_PCT", "1.5")))
+BB_WIDE_WIDTH_PCT = float(os.getenv("BB_WIDE_WIDTH_PCT", os.getenv("BB_EXPANSION_WIDTH_PCT", "4.0")))
 BB_RANK_LIMIT_DEFAULT = int(os.getenv("BB_RANK_LIMIT_DEFAULT", "10"))
-SEND_BB_SQUEEZE_TO_GROUP = os.getenv("SEND_BB_SQUEEZE_TO_GROUP", "false").lower() == "true"
-SEND_BB_EXPANSION_TO_GROUP = os.getenv("SEND_BB_EXPANSION_TO_GROUP", "false").lower() == "true"
+SEND_BB_CLOSE_TO_GROUP = os.getenv("SEND_BB_CLOSE_TO_GROUP", "false").lower() == "true"
+SEND_BB_WIDE_TO_GROUP = os.getenv("SEND_BB_WIDE_TO_GROUP", "false").lower() == "true"
 
 TRADES_HISTORY_LIMIT = int(os.getenv("TRADES_HISTORY_LIMIT", "500"))
 DAILY_REPORT_ENABLED = os.getenv("DAILY_REPORT_ENABLED", "false").lower() == "true"
@@ -138,7 +140,7 @@ last_daily_report_date = None
 # SAFE HELPERS
 # =========================================================
 def log_error(where, exc):
-    print(f"ERROR in {where}: {exc}")
+    print("ERROR in {}: {}".format(where, exc))
     print(traceback.format_exc())
 
 def safe_float(value, default=None):
@@ -165,7 +167,7 @@ def normalize_interval(interval_value):
     return mapping.get(s, s)
 
 def pct_text(value):
-    return "OFF" if value == 0 else f"{value:.2f}%"
+    return "OFF" if value == 0 else "{:.2f}%".format(value)
 
 def bool_text(value):
     return "ON" if value else "OFF"
@@ -201,7 +203,7 @@ def ensure_symbol_state(symbol):
             data[symbol][tf] = []
 
 def should_alert_once_per_candle(alert_type, symbol, tf, candle_start):
-    key = f"{alert_type}:{symbol}:{tf}"
+    key = "{}:{}:{}".format(alert_type, symbol, tf)
     if last_alert_candle.get(key) == candle_start:
         return False
     last_alert_candle[key] = candle_start
@@ -241,7 +243,7 @@ def fmt_qty_or_price(value):
 def _send_telegram_http(chat_id, message):
     if not TELEGRAM_ENABLED or not BOT_TOKEN or not chat_id:
         return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    url = "https://api.telegram.org/bot{}/sendMessage".format(BOT_TOKEN)
     response = requests.post(url, json={"chat_id": chat_id, "text": str(message)[:3900]}, timeout=12)
     response.raise_for_status()
 
@@ -290,7 +292,7 @@ def get_telegram_updates(offset=None, timeout=20):
     if not TELEGRAM_ENABLED or not BOT_TOKEN:
         return []
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+        url = "https://api.telegram.org/bot{}/getUpdates".format(BOT_TOKEN)
         params = {"timeout": timeout}
         if offset is not None:
             params["offset"] = offset
@@ -308,7 +310,8 @@ def get_telegram_updates(offset=None, timeout=20):
 def rsi(values, length=14):
     if len(values) < length + 1:
         return None
-    gains, losses = [], []
+    gains = []
+    losses = []
     for i in range(1, len(values)):
         diff = values[i] - values[i - 1]
         gains.append(max(diff, 0))
@@ -341,53 +344,56 @@ def process_rsi_tier_alerts(symbol, tf, candle_start, rsi_value):
 
     if rsi_value >= ALERT3_RSI_SELL:
         if should_alert_once_per_candle("alert3_rsi_sell", symbol, tf, candle_start):
-            msg = "🚨 ALERT 3 - RSI SELL NOW\nSymbol: {}\nTimeframe: {}m\nRSI: {:.2f}\nThreshold: >= {:.2f}".format(symbol, tf, rsi_value, ALERT3_RSI_SELL)
+            msg = "🚨 ALERT 3 - RSI SELL NOW\nSymbol: {}\nTimeframe: {}m\nRSI: {:.2f}\nYour setup: RSI >= {:.2f}".format(symbol, tf, rsi_value, ALERT3_RSI_SELL)
             send_to_private_and_optional_group(msg, SEND_ALERT3_TO_GROUP)
         return
 
     if rsi_value >= ALERT2_RSI_SELL:
         if should_alert_once_per_candle("alert2_rsi_sell", symbol, tf, candle_start):
-            msg = "🔥 ALERT 2 - EXTREME SELL\nSymbol: {}\nTimeframe: {}m\nRSI: {:.2f}\nThreshold: >= {:.2f}".format(symbol, tf, rsi_value, ALERT2_RSI_SELL)
+            msg = "🔥 ALERT 2 - EXTREME SELL\nSymbol: {}\nTimeframe: {}m\nRSI: {:.2f}\nYour setup: RSI >= {:.2f}".format(symbol, tf, rsi_value, ALERT2_RSI_SELL)
             send_to_private_and_optional_group(msg, SEND_ALERT2_TO_GROUP)
         return
 
     if rsi_value >= ALERT1_RSI_SELL:
         if should_alert_once_per_candle("alert1_rsi_sell", symbol, tf, candle_start):
-            msg = "🚨 ALERT 1 - RSI SELL\nSymbol: {}\nTimeframe: {}m\nRSI: {:.2f}\nThreshold: >= {:.2f}".format(symbol, tf, rsi_value, ALERT1_RSI_SELL)
+            msg = "🚨 ALERT 1 - RSI SELL\nSymbol: {}\nTimeframe: {}m\nRSI: {:.2f}\nYour setup: RSI >= {:.2f}".format(symbol, tf, rsi_value, ALERT1_RSI_SELL)
             send_to_private_and_optional_group(msg, SEND_ALERT1_TO_GROUP)
         return
 
     if rsi_value <= ALERT3_RSI_BUY:
         if should_alert_once_per_candle("alert3_rsi_buy", symbol, tf, candle_start):
-            msg = "🚨 ALERT 3 - RSI BUY NOW\nSymbol: {}\nTimeframe: {}m\nRSI: {:.2f}\nThreshold: <= {:.2f}".format(symbol, tf, rsi_value, ALERT3_RSI_BUY)
+            msg = "🚨 ALERT 3 - RSI BUY NOW\nSymbol: {}\nTimeframe: {}m\nRSI: {:.2f}\nYour setup: RSI <= {:.2f}".format(symbol, tf, rsi_value, ALERT3_RSI_BUY)
             send_to_private_and_optional_group(msg, SEND_ALERT3_TO_GROUP)
         return
 
     if rsi_value <= ALERT2_RSI_BUY:
         if should_alert_once_per_candle("alert2_rsi_buy", symbol, tf, candle_start):
-            msg = "🔥 ALERT 2 - EXTREME BUY\nSymbol: {}\nTimeframe: {}m\nRSI: {:.2f}\nThreshold: <= {:.2f}".format(symbol, tf, rsi_value, ALERT2_RSI_BUY)
+            msg = "🔥 ALERT 2 - EXTREME BUY\nSymbol: {}\nTimeframe: {}m\nRSI: {:.2f}\nYour setup: RSI <= {:.2f}".format(symbol, tf, rsi_value, ALERT2_RSI_BUY)
             send_to_private_and_optional_group(msg, SEND_ALERT2_TO_GROUP)
         return
 
     if rsi_value <= ALERT1_RSI_BUY:
         if should_alert_once_per_candle("alert1_rsi_buy", symbol, tf, candle_start):
-            msg = "🚨 ALERT 1 - RSI BUY\nSymbol: {}\nTimeframe: {}m\nRSI: {:.2f}\nThreshold: <= {:.2f}".format(symbol, tf, rsi_value, ALERT1_RSI_BUY)
+            msg = "🚨 ALERT 1 - RSI BUY\nSymbol: {}\nTimeframe: {}m\nRSI: {:.2f}\nYour setup: RSI <= {:.2f}".format(symbol, tf, rsi_value, ALERT1_RSI_BUY)
             send_to_private_and_optional_group(msg, SEND_ALERT1_TO_GROUP)
         return
 
 def process_bb_alerts(symbol, tf, candle_start, bb):
     if not BB_ALERTS_ENABLED:
         return
+
     width = bb["width_pct"]
-    if width <= BB_SQUEEZE_WIDTH_PCT:
-        if should_alert_once_per_candle("bb_squeeze", symbol, tf, candle_start):
-            msg = "🟡 BB CLOSE / SQUEEZE ALERT\nSymbol: {}\nTimeframe: {}m\nBB width: {:.2f}%\nThreshold: <= {:.2f}%".format(symbol, tf, width, BB_SQUEEZE_WIDTH_PCT)
-            send_to_private_and_optional_group(msg, SEND_BB_SQUEEZE_TO_GROUP)
+
+    if BB_CLOSE_ALERT_ENABLED and width <= BB_CLOSE_WIDTH_PCT:
+        if should_alert_once_per_candle("bb_close", symbol, tf, candle_start):
+            msg = "🟡 BB CLOSE ALERT\nSymbol: {}\nTimeframe: {}m\nBB width: {:.2f}%\nYour setup: BB width <= {:.2f}%".format(symbol, tf, width, BB_CLOSE_WIDTH_PCT)
+            send_to_private_and_optional_group(msg, SEND_BB_CLOSE_TO_GROUP)
         return
-    if width >= BB_EXPANSION_WIDTH_PCT:
-        if should_alert_once_per_candle("bb_expansion", symbol, tf, candle_start):
-            msg = "🟢 BB WIDE EXPANSION ALERT\nSymbol: {}\nTimeframe: {}m\nBB width: {:.2f}%\nThreshold: >= {:.2f}%".format(symbol, tf, width, BB_EXPANSION_WIDTH_PCT)
-            send_to_private_and_optional_group(msg, SEND_BB_EXPANSION_TO_GROUP)
+
+    if BB_WIDE_ALERT_ENABLED and width >= BB_WIDE_WIDTH_PCT:
+        if should_alert_once_per_candle("bb_wide", symbol, tf, candle_start):
+            msg = "🟢 BB WIDE ALERT\nSymbol: {}\nTimeframe: {}m\nBB width: {:.2f}%\nYour setup: BB width >= {:.2f}%".format(symbol, tf, width, BB_WIDE_WIDTH_PCT)
+            send_to_private_and_optional_group(msg, SEND_BB_WIDE_TO_GROUP)
         return
 
 # =========================================================
@@ -429,7 +435,7 @@ def fetch_history(symbol, tf):
         if closes:
             data[symbol][tf] = closes
     except Exception as e:
-        log_error(f"fetch_history {symbol} {tf}", e)
+        log_error("fetch_history {} {}".format(symbol, tf), e)
 
 def refresh_shortlist_and_history():
     global shortlist, live_symbols, last_shortlist_refresh_at
@@ -441,8 +447,8 @@ def refresh_shortlist_and_history():
     with shortlist_lock:
         old_live = set(live_symbols)
 
-    to_fetch = sorted(list(new_live - old_live))
     required = max(20, BB_LENGTH + 1, 15)
+    to_fetch = sorted(list(new_live - old_live))
 
     for symbol in to_fetch:
         ensure_symbol_state(symbol)
@@ -508,8 +514,8 @@ def get_any_symbol_bb_text(symbol, tf="5"):
         if bb is None:
             return "⚠️ Not enough candle data for BB on {} {}m.".format(symbol, tf)
         width = bb["width_pct"]
-        state = "CLOSE / SQUEEZE" if width <= BB_SQUEEZE_WIDTH_PCT else "WIDE EXPANSION" if width >= BB_EXPANSION_WIDTH_PCT else "NORMAL"
-        return "📊 BB WIDTH CHECK\nSymbol: {}\nTimeframe: {}m\nBB({}, {})\nUpper: {:.8f}\nMiddle: {:.8f}\nLower: {:.8f}\nWidth: {:.2f}%\nState: {}\nClose/squeeze <= {:.2f}%\nWide expansion >= {:.2f}%".format(symbol, tf, BB_LENGTH, BB_STD_MULT, bb["upper"], bb["middle"], bb["lower"], width, state, BB_SQUEEZE_WIDTH_PCT, BB_EXPANSION_WIDTH_PCT)
+        state = "BB CLOSE ALERT ZONE" if width <= BB_CLOSE_WIDTH_PCT else "BB WIDE ALERT ZONE" if width >= BB_WIDE_WIDTH_PCT else "NORMAL"
+        return "📊 BB WIDTH CHECK\nSymbol: {}\nTimeframe: {}m\nBB({}, {})\nUpper: {:.8f}\nMiddle: {:.8f}\nLower: {:.8f}\nWidth: {:.2f}%\nState: {}\nClose alert enabled: {}\nWide alert enabled: {}\nYour close setup: <= {:.2f}%\nYour wide setup: >= {:.2f}%".format(symbol, tf, BB_LENGTH, BB_STD_MULT, bb["upper"], bb["middle"], bb["lower"], width, state, bool_text(BB_CLOSE_ALERT_ENABLED), bool_text(BB_WIDE_ALERT_ENABLED), BB_CLOSE_WIDTH_PCT, BB_WIDE_WIDTH_PCT)
     except Exception as e:
         log_error("get_any_symbol_bb_text", e)
         return "❌ Failed to check BB for {}\n{}".format(symbol, e)
@@ -544,7 +550,7 @@ def get_bb_rankings_text(mode="low", limit=10):
         return "⚠️ No BB width values available yet."
     reverse = mode in ("high", "highest", "wide", "widest", "expansion")
     rows.sort(key=lambda x: x[1], reverse=reverse)
-    title = "🟢 WIDEST BB EXPANSION" if reverse else "🟡 CLOSEST BB / SQUEEZE"
+    title = "🟢 WIDEST BB WIDTH" if reverse else "🟡 CLOSEST BB WIDTH"
     lines = [title, "Timeframe: 5m", "BB: length={}, std={}".format(BB_LENGTH, BB_STD_MULT), ""]
     for i, (symbol, width) in enumerate(rows[:limit], start=1):
         lines.append("{}. {} — BB width: {:.2f}%".format(i, symbol, width))
@@ -572,29 +578,37 @@ def handle_kline(msg):
             print("RAW WS:", msg)
         if not isinstance(msg, dict):
             return
+
         topic = str(msg.get("topic", ""))
         parts = topic.split(".")
         topic_interval = normalize_interval(parts[1]) if len(parts) >= 2 else ""
         topic_symbol = parts[2].upper() if len(parts) >= 3 else ""
+
         data_list = msg.get("data")
         if not isinstance(data_list, list):
             return
+
         with shortlist_lock:
             current_live = set(live_symbols)
+
         for item in data_list:
             if not isinstance(item, dict):
                 continue
+
             symbol = normalize_symbol(item.get("symbol") or topic_symbol)
             tf = normalize_interval(item.get("interval") or topic_interval)
             close = safe_float(item.get("close"))
             start_time = safe_int(item.get("start"))
+
             if not symbol or not tf or close is None or start_time is None:
                 continue
             if symbol not in current_live or tf not in TIMEFRAMES:
                 continue
+
             ensure_symbol_state(symbol)
             arr = data[symbol][tf]
             prev_start = current_candle_start[symbol].get(tf)
+
             if prev_start is None or start_time != prev_start:
                 current_candle_start[symbol][tf] = start_time
                 arr.append(close)
@@ -605,7 +619,9 @@ def handle_kline(msg):
                     arr[-1] = close
                 else:
                     arr.append(close)
+
             process_indicators(symbol, tf, start_time)
+
     except Exception as e:
         log_error("handle_kline", e)
 
@@ -627,6 +643,7 @@ def start_websocket_for_timeframe(tf):
         symbols = sorted(list(live_symbols))
     if not symbols:
         return None
+
     print("Subscribing {} symbols for tf={}".format(len(symbols), tf))
     for symbol in symbols:
         try:
@@ -696,7 +713,8 @@ def get_bybit_instrument_info(symbol):
 def refresh_bybit_linear_symbols():
     global bybit_linear_symbols
     try:
-        valid, cursor = set(), None
+        valid = set()
+        cursor = None
         while True:
             params = {"category": CATEGORY, "limit": 1000}
             if cursor:
@@ -729,7 +747,8 @@ def get_bybit_position(symbol):
     return None
 
 def get_bybit_all_open_long_positions():
-    found, cursor = [], None
+    found = []
+    cursor = None
     while True:
         params = {"category": CATEGORY, "limit": 200}
         if cursor:
@@ -971,7 +990,8 @@ def place_bybit_market_sell(symbol, reason="manual_sell"):
 def panic_close_all_positions():
     if not BYBIT_TRADING_ENABLED:
         raise Exception("BYBIT_TRADING_ENABLED is false")
-    closed, errors = [], []
+    closed = []
+    errors = []
     for pos in get_bybit_all_open_long_positions():
         symbol = str(pos.get("symbol", "")).upper()
         try:
@@ -995,8 +1015,10 @@ def auto_entry_loop():
             if get_open_positions_count() >= MAX_OPEN_POSITIONS:
                 time.sleep(AUTO_SCAN_INTERVAL_SECONDS)
                 continue
+
             with shortlist_lock:
                 candidates = list(live_symbols)
+
             signals = []
             for symbol in candidates:
                 if symbol_in_position(symbol) or symbol_on_cooldown(symbol) or not is_symbol_supported_on_bybit(symbol):
@@ -1004,6 +1026,7 @@ def auto_entry_loop():
                 value = get_symbol_rsi(symbol, "5", 14)
                 if value is not None and value <= RSI_BUY_THRESHOLD:
                     signals.append((symbol, value))
+
             signals.sort(key=lambda x: x[1])
             for symbol, value in signals:
                 if get_open_positions_count() >= MAX_OPEN_POSITIONS:
@@ -1026,10 +1049,12 @@ def auto_exit_loop():
             if not current:
                 time.sleep(RISK_CHECK_INTERVAL_SECONDS)
                 continue
+
             for symbol, pos in current:
                 try:
                     price = get_bybit_last_price(symbol)
                     update_position_high_water(symbol, price)
+
                     with positions_lock:
                         p = positions.get(symbol)
                         if not p:
@@ -1039,8 +1064,10 @@ def auto_exit_loop():
                         tsl = p.get("trailing_stop_price")
                         trailing_active = p.get("trailing_active", False)
                         entry = p["entry_price"]
+
                     current_rsi = get_symbol_rsi(symbol, "5", 14)
                     reason = None
+
                     if sl is not None and price <= sl:
                         reason = "stop_loss"
                     elif tp is not None and price >= tp:
@@ -1049,10 +1076,12 @@ def auto_exit_loop():
                         reason = "trailing_stop"
                     elif current_rsi is not None and current_rsi >= RSI_SELL_THRESHOLD:
                         reason = "rsi_exit"
+
                     if reason:
                         order, trade = place_bybit_market_sell(symbol, reason)
                         pnl = "" if not trade else "\nPnL: {:.8f} USDT ({:.2f}%)".format(trade["pnl_usdt"], trade["pnl_pct"])
                         send_telegram("🔴 AUTO EXIT\nReason: {}\nSymbol: {}\nEntry: {:.8f}\nExit trigger: {:.8f}\nOrder ID: {}{}".format(reason, symbol, entry, price, order.get("result", {}).get("orderId"), pnl))
+
                 except Exception as e:
                     log_error("auto exit {}".format(symbol), e)
         except Exception as e:
@@ -1090,7 +1119,7 @@ def get_status_text():
     with shortlist_lock:
         short_count = len(shortlist)
         live_count = len(live_symbols)
-    return "✅ Bot running\nCategory: {}\nLive symbols: {}\nShortlist: {}\nTelegram: {}\nMuted: {}\nBybit trading: {}\nAuto trading: {}\nOpen positions: {}\nRSI alerts: {}\nA1 buy/sell: <= {:.2f} / >= {:.2f}\nA2 buy/sell: <= {:.2f} / >= {:.2f}\nA3 buy/sell: <= {:.2f} / >= {:.2f}\nBB alerts: {}\nBB close <= {:.2f}%\nBB wide >= {:.2f}%\nSL: {}\nTP: {}\nTrailing: {}\nSize: {:.4f} USDT\nLeverage: {}x".format(CATEGORY, live_count, short_count, TELEGRAM_ENABLED, NOTIFICATIONS_MUTED, BYBIT_TRADING_ENABLED, AUTO_TRADING_ENABLED, get_open_positions_count(), bool_text(RSI_ALERTS_ENABLED), ALERT1_RSI_BUY, ALERT1_RSI_SELL, ALERT2_RSI_BUY, ALERT2_RSI_SELL, ALERT3_RSI_BUY, ALERT3_RSI_SELL, bool_text(BB_ALERTS_ENABLED), BB_SQUEEZE_WIDTH_PCT, BB_EXPANSION_WIDTH_PCT, pct_text(STOP_LOSS_PCT), pct_text(TAKE_PROFIT_PCT), pct_text(TRAILING_STOP_PCT), TRADE_SIZE_USDT, LEVERAGE)
+    return "✅ Bot running\nCategory: {}\nLive symbols: {}\nShortlist: {}\nTelegram: {}\nMuted: {}\nBybit trading: {}\nAuto trading: {}\nOpen positions: {}\nRSI alerts: {}\nA1 buy/sell: <= {:.2f} / >= {:.2f}\nA2 buy/sell: <= {:.2f} / >= {:.2f}\nA3 buy/sell: <= {:.2f} / >= {:.2f}\nBB alerts master: {}\nBB close alert: {}\nBB wide alert: {}\nBB close setup <= {:.2f}%\nBB wide setup >= {:.2f}%\nSL: {}\nTP: {}\nTrailing: {}\nSize: {:.4f} USDT\nLeverage: {}x".format(CATEGORY, live_count, short_count, TELEGRAM_ENABLED, NOTIFICATIONS_MUTED, BYBIT_TRADING_ENABLED, AUTO_TRADING_ENABLED, get_open_positions_count(), bool_text(RSI_ALERTS_ENABLED), ALERT1_RSI_BUY, ALERT1_RSI_SELL, ALERT2_RSI_BUY, ALERT2_RSI_SELL, ALERT3_RSI_BUY, ALERT3_RSI_SELL, bool_text(BB_ALERTS_ENABLED), bool_text(BB_CLOSE_ALERT_ENABLED), bool_text(BB_WIDE_ALERT_ENABLED), BB_CLOSE_WIDTH_PCT, BB_WIDE_WIDTH_PCT, pct_text(STOP_LOSS_PCT), pct_text(TAKE_PROFIT_PCT), pct_text(TRAILING_STOP_PCT), TRADE_SIZE_USDT, LEVERAGE)
 
 def get_diag_text():
     age = now_ts() - last_ws_message_at if last_ws_message_at else -1
@@ -1114,7 +1143,9 @@ def telegram_help_text():
         "/setalert1buy 10 | /setalert1sell 85\n"
         "/setalert2buy 8 | /setalert2sell 93\n"
         "/setalert3buy 5 | /setalert3sell 95\n"
-        "/setbbalerts on|off | /setbbclose 1.5 | /setbbwide 4\n"
+        "/setbbalerts on|off\n"
+        "/setbbclosealert on|off | /setbbwidealert on|off\n"
+        "/setbbclose 1.5 | /setbbwide 4\n"
         "/autoon /autooff /buy /sell /panicclose\n"
         "/showpositions /pnl /dailyreport /trades\n"
         "/setrsibuy 5 /setrsisell 95 /setsl 0 /settp 3\n"
@@ -1128,7 +1159,7 @@ def force_test_alerts():
     send_telegram("🚨 ALERT 1 - RSI SELL\nSymbol: BTCUSDT\nRSI: {:.2f}".format(ALERT1_RSI_SELL))
     send_telegram("🔥 ALERT 2 - EXTREME SELL\nSymbol: BTCUSDT\nRSI: {:.2f}".format(ALERT2_RSI_SELL))
     send_to_private_and_optional_group("🚨 ALERT 3 - RSI SELL NOW\nSymbol: BTCUSDT\nRSI: {:.2f}".format(ALERT3_RSI_SELL), SEND_ALERT3_TO_GROUP)
-    send_telegram("🟢 BB WIDE EXPANSION ALERT\nSymbol: BTCUSDT\nBB width: {:.2f}%".format(BB_EXPANSION_WIDTH_PCT))
+    send_telegram("🟢 BB WIDE ALERT\nSymbol: BTCUSDT\nBB width: {:.2f}%".format(BB_WIDE_WIDTH_PCT))
 
 # =========================================================
 # COMMAND LOOP
@@ -1140,7 +1171,7 @@ def telegram_command_loop():
     global BREAK_EVEN_ENABLED, BREAK_EVEN_TRIGGER_PCT, BREAK_EVEN_OFFSET_PCT
     global RSI_BUY_THRESHOLD, RSI_SELL_THRESHOLD, MAX_OPEN_POSITIONS, SYMBOL_COOLDOWN_SECONDS, TRADE_SIZE_USDT, LEVERAGE
     global RSI_ALERTS_ENABLED, ALERT1_RSI_BUY, ALERT1_RSI_SELL, ALERT2_RSI_BUY, ALERT2_RSI_SELL, ALERT3_RSI_BUY, ALERT3_RSI_SELL
-    global BB_ALERTS_ENABLED, BB_SQUEEZE_WIDTH_PCT, BB_EXPANSION_WIDTH_PCT
+    global BB_ALERTS_ENABLED, BB_CLOSE_ALERT_ENABLED, BB_WIDE_ALERT_ENABLED, BB_CLOSE_WIDTH_PCT, BB_WIDE_WIDTH_PCT
 
     if not TELEGRAM_ENABLED:
         print("Telegram command loop disabled")
@@ -1155,13 +1186,16 @@ def telegram_command_loop():
                 chat = message.get("chat", {})
                 text = str(message.get("text", "")).strip()
                 from_chat_id = str(chat.get("id", ""))
+
                 if not text:
                     continue
+
                 allowed = {str(CHAT_ID).strip(), str(GROUP_CHAT_ID).strip()}
                 allowed = {x for x in allowed if x}
                 if allowed and from_chat_id not in allowed:
                     print("Ignoring unauthorized chat:", from_chat_id)
                     continue
+
                 if time.time() - last_command_time < 0.8:
                     time.sleep(0.8)
                 last_command_time = time.time()
@@ -1281,19 +1315,25 @@ def telegram_command_loop():
                         reply_telegram("✅ Alert 3 sell >= {:.2f}".format(v))
                     elif lower.startswith("/setbbalerts "):
                         BB_ALERTS_ENABLED = parse_on_off(text.split(maxsplit=1)[1])
-                        reply_telegram("✅ BB alerts: {}".format(bool_text(BB_ALERTS_ENABLED)))
+                        reply_telegram("✅ BB alerts master: {}".format(bool_text(BB_ALERTS_ENABLED)))
+                    elif lower.startswith("/setbbclosealert "):
+                        BB_CLOSE_ALERT_ENABLED = parse_on_off(text.split(maxsplit=1)[1])
+                        reply_telegram("✅ BB close alert: {}".format(bool_text(BB_CLOSE_ALERT_ENABLED)))
+                    elif lower.startswith("/setbbwidealert "):
+                        BB_WIDE_ALERT_ENABLED = parse_on_off(text.split(maxsplit=1)[1])
+                        reply_telegram("✅ BB wide alert: {}".format(bool_text(BB_WIDE_ALERT_ENABLED)))
                     elif lower.startswith("/setbbclose ") or lower.startswith("/setbbwidthlow "):
                         v = parse_float_arg(text)
-                        if v < 0 or v >= BB_EXPANSION_WIDTH_PCT:
+                        if v < 0 or v >= BB_WIDE_WIDTH_PCT:
                             raise ValueError("BB close must be lower than BB wide")
-                        BB_SQUEEZE_WIDTH_PCT = v
-                        reply_telegram("✅ BB close/squeeze <= {:.2f}%".format(v))
+                        BB_CLOSE_WIDTH_PCT = v
+                        reply_telegram("✅ BB close setup <= {:.2f}%".format(v))
                     elif lower.startswith("/setbbwide ") or lower.startswith("/setbbwidthhigh "):
                         v = parse_float_arg(text)
-                        if v <= BB_SQUEEZE_WIDTH_PCT:
+                        if v <= BB_CLOSE_WIDTH_PCT:
                             raise ValueError("BB wide must be higher than BB close")
-                        BB_EXPANSION_WIDTH_PCT = v
-                        reply_telegram("✅ BB wide expansion >= {:.2f}%".format(v))
+                        BB_WIDE_WIDTH_PCT = v
+                        reply_telegram("✅ BB wide setup >= {:.2f}%".format(v))
                     elif lower.startswith("/setrsibuy "):
                         RSI_BUY_THRESHOLD = parse_float_arg(text)
                         reply_telegram("✅ Auto buy RSI <= {:.2f}".format(RSI_BUY_THRESHOLD))
@@ -1345,7 +1385,9 @@ def telegram_command_loop():
                 except Exception as e:
                     log_error("command {}".format(text), e)
                     reply_telegram("❌ Command failed\n{}".format(e))
+
             time.sleep(1)
+
         except Exception as e:
             log_error("telegram_command_loop", e)
             time.sleep(5)
@@ -1439,7 +1481,7 @@ def main():
     print("BYBIT_TRADING_ENABLED =", BYBIT_TRADING_ENABLED)
     print("BYBIT_KEYS_READY =", bybit_keys_ready())
     print("RSI TIERS:", ALERT1_RSI_BUY, ALERT1_RSI_SELL, ALERT2_RSI_BUY, ALERT2_RSI_SELL, ALERT3_RSI_BUY, ALERT3_RSI_SELL)
-    print("BB:", BB_LENGTH, BB_STD_MULT, BB_SQUEEZE_WIDTH_PCT, BB_EXPANSION_WIDTH_PCT)
+    print("BB:", BB_LENGTH, BB_STD_MULT, "close", BB_CLOSE_WIDTH_PCT, "wide", BB_WIDE_WIDTH_PCT, "close_alert", BB_CLOSE_ALERT_ENABLED, "wide_alert", BB_WIDE_ALERT_ENABLED)
 
     start_daemon(telegram_sender_loop, "telegram_sender")
     send_telegram("🚀 Scanner started")
