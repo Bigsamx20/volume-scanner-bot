@@ -59,24 +59,36 @@ RISK_CHECK_INTERVAL_SECONDS = float(os.getenv("RISK_CHECK_INTERVAL_SECONDS", "5"
 AUTO_SCAN_INTERVAL_SECONDS = float(os.getenv("AUTO_SCAN_INTERVAL_SECONDS", "10"))
 
 # =========================================================
-# PREFERRED ALERT VALUES
-# Bot sends alerts ONLY when these preferred values are hit.
-# You can change them from Telegram commands.
+# RSI ALERT TIERS - YOUR PREFERRED SETUP
+# Alert 1 = early warning
+# Alert 2 = stronger signal
+# Alert 3 = extreme signal
+# The bot now sends ONLY the highest matching RSI tier per candle.
 # =========================================================
 RSI_ALERTS_ENABLED = os.getenv("RSI_ALERTS_ENABLED", "true").lower() == "true"
-PREFERRED_RSI_BUY = float(os.getenv("PREFERRED_RSI_BUY", "5"))
-PREFERRED_RSI_SELL = float(os.getenv("PREFERRED_RSI_SELL", "95"))
 
+ALERT1_RSI_BUY = float(os.getenv("ALERT1_RSI_BUY", "10"))
+ALERT1_RSI_SELL = float(os.getenv("ALERT1_RSI_SELL", "85"))
+ALERT2_RSI_BUY = float(os.getenv("ALERT2_RSI_BUY", "8"))
+ALERT2_RSI_SELL = float(os.getenv("ALERT2_RSI_SELL", "93"))
+ALERT3_RSI_BUY = float(os.getenv("ALERT3_RSI_BUY", "5"))
+ALERT3_RSI_SELL = float(os.getenv("ALERT3_RSI_SELL", "95"))
+
+# Alert routing
+SEND_ALERT1_TO_GROUP = os.getenv("SEND_ALERT1_TO_GROUP", "false").lower() == "true"
+SEND_ALERT2_TO_GROUP = os.getenv("SEND_ALERT2_TO_GROUP", "false").lower() == "true"
+SEND_ALERT3_TO_GROUP = os.getenv("SEND_ALERT3_TO_GROUP", "true").lower() == "true"
+
+# =========================================================
+# BOLLINGER BAND CONFIG
+# =========================================================
 BB_ALERTS_ENABLED = os.getenv("BB_ALERTS_ENABLED", "true").lower() == "true"
 BB_LENGTH = int(os.getenv("BB_LENGTH", "20"))
 BB_STD_MULT = float(os.getenv("BB_STD_MULT", "2"))
-PREFERRED_BB_SQUEEZE_WIDTH_PCT = float(os.getenv("PREFERRED_BB_SQUEEZE_WIDTH_PCT", "1.5"))
-PREFERRED_BB_EXPANSION_WIDTH_PCT = float(os.getenv("PREFERRED_BB_EXPANSION_WIDTH_PCT", "4.0"))
+BB_SQUEEZE_WIDTH_PCT = float(os.getenv("BB_SQUEEZE_WIDTH_PCT", "1.5"))
+BB_EXPANSION_WIDTH_PCT = float(os.getenv("BB_EXPANSION_WIDTH_PCT", "4.0"))
 BB_RANK_LIMIT_DEFAULT = int(os.getenv("BB_RANK_LIMIT_DEFAULT", "10"))
 
-# Alert routing
-SEND_RSI_BUY_TO_GROUP = os.getenv("SEND_RSI_BUY_TO_GROUP", "false").lower() == "true"
-SEND_RSI_SELL_TO_GROUP = os.getenv("SEND_RSI_SELL_TO_GROUP", "false").lower() == "true"
 SEND_BB_SQUEEZE_TO_GROUP = os.getenv("SEND_BB_SQUEEZE_TO_GROUP", "false").lower() == "true"
 SEND_BB_EXPANSION_TO_GROUP = os.getenv("SEND_BB_EXPANSION_TO_GROUP", "false").lower() == "true"
 
@@ -360,40 +372,119 @@ def bollinger_bands(values, length=20, std_mult=2.0):
     width_pct = 0.0 if mid == 0 else ((upper - lower) / mid) * 100.0
     return {"upper": upper, "middle": mid, "lower": lower, "width_pct": width_pct}
 
-def process_preferred_rsi_alerts(symbol: str, tf: str, candle_start: int, rsi_value: float):
+def process_rsi_tier_alerts(symbol: str, tf: str, candle_start: int, rsi_value: float):
+    """
+    Your original Alert 1/2/3 setup, upgraded:
+    - Alert 1, 2, 3 are kept.
+    - Only the strongest matching tier is sent per candle.
+    - Example sell side: if RSI is 96, only Alert 3 sends, not Alert 1 + 2 + 3.
+    """
     if not RSI_ALERTS_ENABLED:
         return
-    if rsi_value <= PREFERRED_RSI_BUY and should_alert_once_per_candle("preferred_rsi_buy", symbol, tf, candle_start):
-        msg = (
-            f"🟢 RSI BUY ALERT\n"
-            f"Symbol: {symbol}\nTimeframe: {tf}m\n"
-            f"RSI: {rsi_value:.2f}\nYour buy value: <= {PREFERRED_RSI_BUY:.2f}"
-        )
-        send_to_private_and_optional_group(msg, SEND_RSI_BUY_TO_GROUP)
-    if rsi_value >= PREFERRED_RSI_SELL and should_alert_once_per_candle("preferred_rsi_sell", symbol, tf, candle_start):
-        msg = (
-            f"🔴 RSI SELL ALERT\n"
-            f"Symbol: {symbol}\nTimeframe: {tf}m\n"
-            f"RSI: {rsi_value:.2f}\nYour sell value: >= {PREFERRED_RSI_SELL:.2f}"
-        )
-        send_to_private_and_optional_group(msg, SEND_RSI_SELL_TO_GROUP)
+
+    # SELL SIDE - strongest first
+    if rsi_value >= ALERT3_RSI_SELL:
+        if should_alert_once_per_candle("alert3_rsi_sell", symbol, tf, candle_start):
+            msg = (
+                f"🚨 ALERT 3 - RSI SELL NOW
+"
+                f"Symbol: {symbol}
+Timeframe: {tf}m
+"
+                f"RSI: {rsi_value:.2f}
+Threshold: >= {ALERT3_RSI_SELL:.2f}"
+            )
+            send_to_private_and_optional_group(msg, SEND_ALERT3_TO_GROUP)
+        return
+
+    if rsi_value >= ALERT2_RSI_SELL:
+        if should_alert_once_per_candle("alert2_rsi_sell", symbol, tf, candle_start):
+            msg = (
+                f"🔥 ALERT 2 - EXTREME SELL
+"
+                f"Symbol: {symbol}
+Timeframe: {tf}m
+"
+                f"RSI: {rsi_value:.2f}
+Threshold: >= {ALERT2_RSI_SELL:.2f}"
+            )
+            send_to_private_and_optional_group(msg, SEND_ALERT2_TO_GROUP)
+        return
+
+    if rsi_value >= ALERT1_RSI_SELL:
+        if should_alert_once_per_candle("alert1_rsi_sell", symbol, tf, candle_start):
+            msg = (
+                f"🚨 ALERT 1 - RSI SELL
+"
+                f"Symbol: {symbol}
+Timeframe: {tf}m
+"
+                f"RSI: {rsi_value:.2f}
+Threshold: >= {ALERT1_RSI_SELL:.2f}"
+            )
+            send_to_private_and_optional_group(msg, SEND_ALERT1_TO_GROUP)
+        return
+
+    # BUY SIDE - strongest first
+    if rsi_value <= ALERT3_RSI_BUY:
+        if should_alert_once_per_candle("alert3_rsi_buy", symbol, tf, candle_start):
+            msg = (
+                f"🚨 ALERT 3 - RSI BUY NOW
+"
+                f"Symbol: {symbol}
+Timeframe: {tf}m
+"
+                f"RSI: {rsi_value:.2f}
+Threshold: <= {ALERT3_RSI_BUY:.2f}"
+            )
+            send_to_private_and_optional_group(msg, SEND_ALERT3_TO_GROUP)
+        return
+
+    if rsi_value <= ALERT2_RSI_BUY:
+        if should_alert_once_per_candle("alert2_rsi_buy", symbol, tf, candle_start):
+            msg = (
+                f"🔥 ALERT 2 - EXTREME BUY
+"
+                f"Symbol: {symbol}
+Timeframe: {tf}m
+"
+                f"RSI: {rsi_value:.2f}
+Threshold: <= {ALERT2_RSI_BUY:.2f}"
+            )
+            send_to_private_and_optional_group(msg, SEND_ALERT2_TO_GROUP)
+        return
+
+    if rsi_value <= ALERT1_RSI_BUY:
+        if should_alert_once_per_candle("alert1_rsi_buy", symbol, tf, candle_start):
+            msg = (
+                f"🚨 ALERT 1 - RSI BUY
+"
+                f"Symbol: {symbol}
+Timeframe: {tf}m
+"
+                f"RSI: {rsi_value:.2f}
+Threshold: <= {ALERT1_RSI_BUY:.2f}"
+            )
+            send_to_private_and_optional_group(msg, SEND_ALERT1_TO_GROUP)
+        return
+
 
 def process_preferred_bb_alerts(symbol: str, tf: str, candle_start: int, bb: dict):
     if not BB_ALERTS_ENABLED:
         return
     width = bb["width_pct"]
-    if width <= PREFERRED_BB_SQUEEZE_WIDTH_PCT and should_alert_once_per_candle("preferred_bb_squeeze", symbol, tf, candle_start):
+    if width <= BB_SQUEEZE_WIDTH_PCT and should_alert_once_per_candle("preferred_bb_squeeze", symbol, tf, candle_start):
         msg = (
             f"🟡 BB SQUEEZE ALERT\n"
             f"Symbol: {symbol}\nTimeframe: {tf}m\n"
-            f"BB width: {width:.2f}%\nYour squeeze value: <= {PREFERRED_BB_SQUEEZE_WIDTH_PCT:.2f}%"
+            f"BB width: {width:.2f}%\nYour squeeze value: <= {BB_SQUEEZE_WIDTH_PCT:.2f}%"
         )
         send_to_private_and_optional_group(msg, SEND_BB_SQUEEZE_TO_GROUP)
-    if width >= PREFERRED_BB_EXPANSION_WIDTH_PCT and should_alert_once_per_candle("preferred_bb_expansion", symbol, tf, candle_start):
+    if width >= BB_EXPANSION_WIDTH_PCT and should_alert_once_per_candle("preferred_bb_expansion", symbol, tf, candle_start):
         msg = (
             f"🟢 BB EXPANSION ALERT\n"
             f"Symbol: {symbol}\nTimeframe: {tf}m\n"
-            f"BB width: {width:.2f}%\nYour expansion value: >= {PREFERRED_BB_EXPANSION_WIDTH_PCT:.2f}%"
+            f"BB width: {width:.2f}%\nYour expansion value: >= {BB_EXPANSION_WIDTH_PCT:.2f}%"
         )
         send_to_private_and_optional_group(msg, SEND_BB_EXPANSION_TO_GROUP)
 
@@ -713,8 +804,8 @@ def get_strategy_text():
         f"🤖 Auto strategy\nAuto trading: {AUTO_TRADING_ENABLED}\nExchange trading: Bybit MAINNET ({CATEGORY})\nNotifications muted: {NOTIFICATIONS_MUTED}\n"
         f"Timeframes: {', '.join(TIMEFRAMES)}\nLive symbols watched: {LIVE_WS_SYMBOLS}\n"
         f"Auto buy rule: 5m RSI <= {RSI_BUY_THRESHOLD:.2f}\nAuto sell rule: 5m RSI >= {RSI_SELL_THRESHOLD:.2f} OR SL/TP/Trailing\n"
-        f"Preferred RSI alerts: {bool_text(RSI_ALERTS_ENABLED)}\nRSI buy alert <= {PREFERRED_RSI_BUY:.2f}\nRSI sell alert >= {PREFERRED_RSI_SELL:.2f}\n"
-        f"Preferred BB alerts: {bool_text(BB_ALERTS_ENABLED)}\nBB length: {BB_LENGTH}\nBB std mult: {BB_STD_MULT:.2f}\nBB squeeze alert <= {PREFERRED_BB_SQUEEZE_WIDTH_PCT:.2f}%\nBB expansion alert >= {PREFERRED_BB_EXPANSION_WIDTH_PCT:.2f}%\n"
+        f"Preferred RSI alerts: {bool_text(RSI_ALERTS_ENABLED)}\nRSI buy alert <= {ALERT3_RSI_BUY:.2f}\nRSI sell alert >= {ALERT3_RSI_SELL:.2f}\n"
+        f"Preferred BB alerts: {bool_text(BB_ALERTS_ENABLED)}\nBB length: {BB_LENGTH}\nBB std mult: {BB_STD_MULT:.2f}\nBB squeeze alert <= {BB_SQUEEZE_WIDTH_PCT:.2f}%\nBB expansion alert >= {BB_EXPANSION_WIDTH_PCT:.2f}%\n"
         f"Stop loss: {pct_text(STOP_LOSS_PCT)}\nTake profit: {pct_text(TAKE_PROFIT_PCT)}\nTrailing stop: {pct_text(TRAILING_STOP_PCT)}\n"
         f"Trailing activation: {pct_text(TRAILING_START_PCT)}\nBreak-even stop: {BREAK_EVEN_ENABLED}\nBreak-even trigger: {pct_text(BREAK_EVEN_TRIGGER_PCT)}\nBreak-even offset: {pct_text(BREAK_EVEN_OFFSET_PCT)}\nMax open positions: {MAX_OPEN_POSITIONS}\nSymbol cooldown: {SYMBOL_COOLDOWN_SECONDS}s\n"
         f"Trade size margin: {TRADE_SIZE_USDT:.4f} USDT\nLeverage: {LEVERAGE}x\nApprox position notional/trade: {(TRADE_SIZE_USDT * LEVERAGE):.4f} USDT\n"
@@ -883,8 +974,8 @@ def get_any_symbol_rsi_text(symbol: str, tf: str = "5", length: int = 14):
         if value is None:
             return f"⚠️ RSI unavailable for {symbol}."
         price = arr[-1]
-        state = "BUY ZONE" if value <= PREFERRED_RSI_BUY else "SELL ZONE" if value >= PREFERRED_RSI_SELL else "NORMAL"
-        return f"📊 RSI CHECK\nSymbol: {symbol}\nTimeframe: {tf}m\nRSI({length}): {value:.2f}\nLast close: {price}\nState: {state}\nYour buy alert: <= {PREFERRED_RSI_BUY:.2f}\nYour sell alert: >= {PREFERRED_RSI_SELL:.2f}"
+        state = "BUY ZONE" if value <= ALERT3_RSI_BUY else "SELL ZONE" if value >= ALERT3_RSI_SELL else "NORMAL"
+        return f"📊 RSI CHECK\nSymbol: {symbol}\nTimeframe: {tf}m\nRSI({length}): {value:.2f}\nLast close: {price}\nState: {state}\nYour buy alert: <= {ALERT3_RSI_BUY:.2f}\nYour sell alert: >= {ALERT3_RSI_SELL:.2f}"
     except Exception as e:
         return f"❌ Failed to check RSI for {symbol}\n{e}"
 
@@ -901,11 +992,11 @@ def get_any_symbol_bb_text(symbol: str, tf: str = "5", length: int = BB_LENGTH, 
         bb = bollinger_bands(arr, length, std_mult)
         if bb is None:
             return f"⚠️ Not enough candle data for BB on {symbol} {tf}m."
-        state = "CLOSE EXPANSION / SQUEEZE" if bb["width_pct"] <= PREFERRED_BB_SQUEEZE_WIDTH_PCT else "WIDEST EXPANSION" if bb["width_pct"] >= PREFERRED_BB_EXPANSION_WIDTH_PCT else "NORMAL"
+        state = "CLOSE EXPANSION / SQUEEZE" if bb["width_pct"] <= BB_SQUEEZE_WIDTH_PCT else "WIDEST EXPANSION" if bb["width_pct"] >= BB_EXPANSION_WIDTH_PCT else "NORMAL"
         return (
             f"📊 BB WIDTH CHECK\nSymbol: {symbol}\nTimeframe: {tf}m\nBB({length}, {std_mult:g})\n"
             f"Upper: {bb['upper']:.8f}\nMiddle: {bb['middle']:.8f}\nLower: {bb['lower']:.8f}\nWidth: {bb['width_pct']:.2f}%\nState: {state}\n"
-            f"Your close expansion/squeeze: <= {PREFERRED_BB_SQUEEZE_WIDTH_PCT:.2f}%\nYour widest expansion: >= {PREFERRED_BB_EXPANSION_WIDTH_PCT:.2f}%"
+            f"Your close expansion/squeeze: <= {BB_SQUEEZE_WIDTH_PCT:.2f}%\nYour widest expansion: >= {BB_EXPANSION_WIDTH_PCT:.2f}%"
         )
     except Exception as e:
         return f"❌ Failed to check BB for {symbol}\n{e}"
@@ -927,9 +1018,9 @@ def get_rsi_rankings_text(mode: str = "low", limit: int = 10):
     rows.sort(key=lambda x: x[1], reverse=reverse)
     selected = rows[:limit]
     title = "🔥 HIGHEST RSI COINS" if reverse else "🧊 LOWEST RSI COINS"
-    lines = [title, "Timeframe: 5m", "RSI Length: 14", f"Your buy alert <= {PREFERRED_RSI_BUY:.2f} | sell alert >= {PREFERRED_RSI_SELL:.2f}", ""]
+    lines = [title, "Timeframe: 5m", "RSI Length: 14", f"Your buy alert <= {ALERT3_RSI_BUY:.2f} | sell alert >= {ALERT3_RSI_SELL:.2f}", ""]
     for i, (symbol, value) in enumerate(selected, start=1):
-        flag = " ✅ ALERT ZONE" if (value <= PREFERRED_RSI_BUY or value >= PREFERRED_RSI_SELL) else ""
+        flag = " ✅ ALERT ZONE" if (value <= ALERT3_RSI_BUY or value >= ALERT3_RSI_SELL) else ""
         lines.append(f"{i}. {symbol} — RSI: {value:.2f}{flag}")
     return "\n".join(lines)
 
@@ -950,9 +1041,9 @@ def get_bb_rankings_text(mode: str = "low", limit: int = BB_RANK_LIMIT_DEFAULT):
     rows.sort(key=lambda x: x[1], reverse=reverse)
     selected = rows[:limit]
     title = "🟢 WIDEST BB EXPANSION" if reverse else "🟡 CLOSEST BB EXPANSION / SQUEEZE"
-    lines = [title, "Timeframe: 5m", f"BB: length={BB_LENGTH}, std={BB_STD_MULT:g}", f"Your squeeze <= {PREFERRED_BB_SQUEEZE_WIDTH_PCT:.2f}% | expansion >= {PREFERRED_BB_EXPANSION_WIDTH_PCT:.2f}%", ""]
+    lines = [title, "Timeframe: 5m", f"BB: length={BB_LENGTH}, std={BB_STD_MULT:g}", f"Your squeeze <= {BB_SQUEEZE_WIDTH_PCT:.2f}% | expansion >= {BB_EXPANSION_WIDTH_PCT:.2f}%", ""]
     for i, (symbol, width) in enumerate(selected, start=1):
-        flag = " ✅ ALERT ZONE" if (width <= PREFERRED_BB_SQUEEZE_WIDTH_PCT or width >= PREFERRED_BB_EXPANSION_WIDTH_PCT) else ""
+        flag = " ✅ ALERT ZONE" if (width <= BB_SQUEEZE_WIDTH_PCT or width >= BB_EXPANSION_WIDTH_PCT) else ""
         lines.append(f"{i}. {symbol} — BB width: {width:.2f}%{flag}")
     return "\n".join(lines)
 
@@ -968,7 +1059,7 @@ def process_indicators(symbol: str, tf: str, candle_start: int):
     if rsi_cfg.get("enabled", False):
         value = rsi(arr, int(rsi_cfg.get("length", 14)))
         if value is not None:
-            process_preferred_rsi_alerts(symbol, tf, candle_start, value)
+            process_rsi_tier_alerts(symbol, tf, candle_start, value)
     bb_cfg = cfg.get("bb", {})
     if bb_cfg.get("enabled", True):
         bb = bollinger_bands(arr, int(bb_cfg.get("length", BB_LENGTH)), float(bb_cfg.get("std_mult", BB_STD_MULT)))
@@ -1248,10 +1339,10 @@ def auto_exit_loop():
 # TELEGRAM COMMANDS
 # =========================================================
 def force_test_alerts():
-    send_telegram(f"🟢 RSI BUY ALERT\nSymbol: BTCUSDT\nTimeframe: 5m\nRSI: {PREFERRED_RSI_BUY:.2f}\nYour buy value: <= {PREFERRED_RSI_BUY:.2f}")
-    send_telegram(f"🔴 RSI SELL ALERT\nSymbol: BTCUSDT\nTimeframe: 5m\nRSI: {PREFERRED_RSI_SELL:.2f}\nYour sell value: >= {PREFERRED_RSI_SELL:.2f}")
-    send_telegram(f"🟡 BB SQUEEZE ALERT\nSymbol: BTCUSDT\nTimeframe: 5m\nBB width: {PREFERRED_BB_SQUEEZE_WIDTH_PCT:.2f}%\nYour squeeze value: <= {PREFERRED_BB_SQUEEZE_WIDTH_PCT:.2f}%")
-    send_telegram(f"🟢 BB EXPANSION ALERT\nSymbol: BTCUSDT\nTimeframe: 5m\nBB width: {PREFERRED_BB_EXPANSION_WIDTH_PCT:.2f}%\nYour expansion value: >= {PREFERRED_BB_EXPANSION_WIDTH_PCT:.2f}%")
+    send_telegram(f"🟢 RSI BUY ALERT\nSymbol: BTCUSDT\nTimeframe: 5m\nRSI: {ALERT3_RSI_BUY:.2f}\nYour buy value: <= {ALERT3_RSI_BUY:.2f}")
+    send_telegram(f"🔴 RSI SELL ALERT\nSymbol: BTCUSDT\nTimeframe: 5m\nRSI: {ALERT3_RSI_SELL:.2f}\nYour sell value: >= {ALERT3_RSI_SELL:.2f}")
+    send_telegram(f"🟡 BB SQUEEZE ALERT\nSymbol: BTCUSDT\nTimeframe: 5m\nBB width: {BB_SQUEEZE_WIDTH_PCT:.2f}%\nYour squeeze value: <= {BB_SQUEEZE_WIDTH_PCT:.2f}%")
+    send_telegram(f"🟢 BB EXPANSION ALERT\nSymbol: BTCUSDT\nTimeframe: 5m\nBB width: {BB_EXPANSION_WIDTH_PCT:.2f}%\nYour expansion value: >= {BB_EXPANSION_WIDTH_PCT:.2f}%")
 
 def get_status_text():
     with shortlist_lock:
@@ -1262,8 +1353,8 @@ def get_status_text():
         f"Shortlist size: {len(symbols)}\nLive symbols: {len(live)}\nHistory limit: {HISTORY_LIMIT}\nTelegram enabled: {TELEGRAM_ENABLED}\nNotifications muted: {NOTIFICATIONS_MUTED}\n"
         f"Bybit trading enabled: {BYBIT_TRADING_ENABLED}\nBybit keys loaded: {bybit_keys_ready()}\nAuto trading enabled: {AUTO_TRADING_ENABLED}\nDaily report enabled: {DAILY_REPORT_ENABLED}\n"
         f"Current open positions: {get_open_positions_count()}\nMax open positions: {MAX_OPEN_POSITIONS}\nAuto buy RSI <= {RSI_BUY_THRESHOLD:.2f}\nAuto sell RSI >= {RSI_SELL_THRESHOLD:.2f}\n"
-        f"Preferred RSI alerts: {bool_text(RSI_ALERTS_ENABLED)}\nPreferred RSI buy <= {PREFERRED_RSI_BUY:.2f}\nPreferred RSI sell >= {PREFERRED_RSI_SELL:.2f}\n"
-        f"Preferred BB alerts: {bool_text(BB_ALERTS_ENABLED)}\nBB length: {BB_LENGTH}\nBB std mult: {BB_STD_MULT:.2f}\nPreferred close expansion/squeeze <= {PREFERRED_BB_SQUEEZE_WIDTH_PCT:.2f}%\nPreferred widest expansion >= {PREFERRED_BB_EXPANSION_WIDTH_PCT:.2f}%\n"
+        f"Preferred RSI alerts: {bool_text(RSI_ALERTS_ENABLED)}\nPreferred RSI buy <= {ALERT3_RSI_BUY:.2f}\nPreferred RSI sell >= {ALERT3_RSI_SELL:.2f}\n"
+        f"Preferred BB alerts: {bool_text(BB_ALERTS_ENABLED)}\nBB length: {BB_LENGTH}\nBB std mult: {BB_STD_MULT:.2f}\nPreferred close expansion/squeeze <= {BB_SQUEEZE_WIDTH_PCT:.2f}%\nPreferred widest expansion >= {BB_EXPANSION_WIDTH_PCT:.2f}%\n"
         f"SL: {pct_text(STOP_LOSS_PCT)}\nTP: {pct_text(TAKE_PROFIT_PCT)}\nTrailing: {pct_text(TRAILING_STOP_PCT)}\nTrail start: {pct_text(TRAILING_START_PCT)}\n"
         f"Break-even: {BREAK_EVEN_ENABLED}\nBE trigger: {pct_text(BREAK_EVEN_TRIGGER_PCT)}\nBE offset: {pct_text(BREAK_EVEN_OFFSET_PCT)}\n"
         f"Symbol cooldown: {SYMBOL_COOLDOWN_SECONDS}s\nTrade size margin: {TRADE_SIZE_USDT:.4f} USDT\nLeverage: {LEVERAGE}x\nApprox notional/trade: {(TRADE_SIZE_USDT * LEVERAGE):.4f} USDT"
@@ -1287,8 +1378,8 @@ def get_diag_text():
     return (
         f"🛠 DIAG\nws_keys: {ws_keys}\nlast_ws_message_age_sec: {last_ws_age}\nlast_shortlist_refresh_age_sec: {last_refresh_age}\nWS_DEBUG: {WS_DEBUG}\n"
         f"LIVE_WS_SYMBOLS: {LIVE_WS_SYMBOLS}\nBYBIT_TRADING_ENABLED: {BYBIT_TRADING_ENABLED}\nBYBIT_KEYS_READY: {bybit_keys_ready()}\nAUTO_TRADING_ENABLED: {AUTO_TRADING_ENABLED}\nNOTIFICATIONS_MUTED: {NOTIFICATIONS_MUTED}\n"
-        f"RSI_ALERTS_ENABLED: {RSI_ALERTS_ENABLED}\nPREFERRED_RSI_BUY: {PREFERRED_RSI_BUY}\nPREFERRED_RSI_SELL: {PREFERRED_RSI_SELL}\n"
-        f"BB_ALERTS_ENABLED: {BB_ALERTS_ENABLED}\nBB_LENGTH: {BB_LENGTH}\nBB_STD_MULT: {BB_STD_MULT}\nPREFERRED_BB_SQUEEZE_WIDTH_PCT: {PREFERRED_BB_SQUEEZE_WIDTH_PCT}\nPREFERRED_BB_EXPANSION_WIDTH_PCT: {PREFERRED_BB_EXPANSION_WIDTH_PCT}\n"
+        f"RSI_ALERTS_ENABLED: {RSI_ALERTS_ENABLED}\nALERT3_RSI_BUY: {ALERT3_RSI_BUY}\nALERT3_RSI_SELL: {ALERT3_RSI_SELL}\n"
+        f"BB_ALERTS_ENABLED: {BB_ALERTS_ENABLED}\nBB_LENGTH: {BB_LENGTH}\nBB_STD_MULT: {BB_STD_MULT}\nBB_SQUEEZE_WIDTH_PCT: {BB_SQUEEZE_WIDTH_PCT}\nBB_EXPANSION_WIDTH_PCT: {BB_EXPANSION_WIDTH_PCT}\n"
         f"STOP_LOSS_PCT: {STOP_LOSS_PCT}\nTAKE_PROFIT_PCT: {TAKE_PROFIT_PCT}\nTRAILING_STOP_PCT: {TRAILING_STOP_PCT}\nTRAILING_START_PCT: {TRAILING_START_PCT}\nBREAK_EVEN_ENABLED: {BREAK_EVEN_ENABLED}\nBREAK_EVEN_TRIGGER_PCT: {BREAK_EVEN_TRIGGER_PCT}\nBREAK_EVEN_OFFSET_PCT: {BREAK_EVEN_OFFSET_PCT}\nMAX_OPEN_POSITIONS: {MAX_OPEN_POSITIONS}\nTRADE_SIZE_USDT: {TRADE_SIZE_USDT}\n"
         f"LEVERAGE: {LEVERAGE}\nCLOSED_TRADES_COUNT: {trades_count}\nSUPPORTED_BYBIT_USDT_SYMBOLS: {bybit_count}\nTELEGRAM_QUEUE_SIZE: {telegram_queue.qsize()}"
     )
@@ -1303,7 +1394,14 @@ def telegram_help_text():
         "/autoon - enable auto trading\n/autooff - disable auto trading\n/showstrategy - show auto strategy\n/showpositions - show tracked positions\n"
         "/rsi BTCUSDT - check RSI for any coin\n/rsi BTCUSDT 5 - check RSI for coin/timeframe\n/rsilow 10 - show lowest RSI coins watched\n/rsihigh 10 - show highest RSI coins watched\n"
         "/bb BTCUSDT - check BB width of any coin\n/bb BTCUSDT 5 - check BB width coin/timeframe\n/bb close 10 - closest BB expansion/squeeze list\n/bb wide 10 - widest BB expansion list\n"
-        "/setrsialerts on|off - enable or disable RSI alerts\n/setrsibuyalert 5 - set preferred RSI buy alert value\n/setrsisellalert 95 - set preferred RSI sell alert value\n"
+        "/setrsialerts on|off - enable or disable RSI alerts
+/setalert1buy 10 - set Alert 1 buy RSI
+/setalert1sell 85 - set Alert 1 sell RSI
+/setalert2buy 8 - set Alert 2 buy RSI
+/setalert2sell 93 - set Alert 2 sell RSI
+/setalert3buy 5 - set Alert 3 buy RSI
+/setalert3sell 95 - set Alert 3 sell RSI
+"
         "/setbbalerts on|off - enable or disable BB alerts\n/setbbclose 1.5 - set close expansion/squeeze BB width %\n/setbbwide 4.0 - set widest expansion BB width %\n"
         "/setrsibuy 5 - set auto-trade buy threshold\n/setrsisell 95 - set auto-trade sell threshold\n/setsl 0 - set stop loss percent, 0 OFF\n/settp 3 - set take profit percent, 0 OFF\n"
         "/settrailing 2 - set trailing stop percent, 0 OFF\n/settrailstart 1 - set trailing activation percent\n/setbe on|off - break-even stop\n/setbetrigger 1 - break-even trigger %\n/setbeoffset 0.1 - break-even offset %\n"
@@ -1323,7 +1421,7 @@ def telegram_command_loop():
     global AUTO_TRADING_ENABLED, NOTIFICATIONS_MUTED, STOP_LOSS_PCT, TAKE_PROFIT_PCT, TRAILING_STOP_PCT, TRAILING_START_PCT
     global BREAK_EVEN_ENABLED, BREAK_EVEN_TRIGGER_PCT, BREAK_EVEN_OFFSET_PCT
     global RSI_BUY_THRESHOLD, RSI_SELL_THRESHOLD, MAX_OPEN_POSITIONS, SYMBOL_COOLDOWN_SECONDS, TRADE_SIZE_USDT, LEVERAGE
-    global RSI_ALERTS_ENABLED, PREFERRED_RSI_BUY, PREFERRED_RSI_SELL, BB_ALERTS_ENABLED, PREFERRED_BB_SQUEEZE_WIDTH_PCT, PREFERRED_BB_EXPANSION_WIDTH_PCT
+    global RSI_ALERTS_ENABLED, ALERT1_RSI_BUY, ALERT1_RSI_SELL, ALERT2_RSI_BUY, ALERT2_RSI_SELL, ALERT3_RSI_BUY, ALERT3_RSI_SELL, BB_ALERTS_ENABLED, BB_SQUEEZE_WIDTH_PCT, BB_EXPANSION_WIDTH_PCT
     if not TELEGRAM_ENABLED:
         print("Telegram command loop disabled")
         return
@@ -1469,28 +1567,78 @@ def telegram_command_loop():
                         reply_telegram(f"✅ RSI alerts: {bool_text(RSI_ALERTS_ENABLED)}")
                     except Exception as e:
                         reply_telegram(f"❌ Usage: /setrsialerts on or /setrsialerts off\n{e}")
-                elif lower.startswith("/setrsibuyalert "):
+                elif lower.startswith("/setalert1buy "):
                     try:
                         value = parse_float_command(text)
                         if not 0 <= value <= 100:
                             raise Exception("RSI value must be between 0 and 100")
-                        if value >= PREFERRED_RSI_SELL:
-                            raise Exception(f"Buy alert must be lower than sell alert ({PREFERRED_RSI_SELL:.2f})")
-                        PREFERRED_RSI_BUY = value
-                        reply_telegram(f"✅ Preferred RSI buy alert updated\nBuy alert <= {PREFERRED_RSI_BUY:.2f}\nSell alert >= {PREFERRED_RSI_SELL:.2f}")
+                        if value <= ALERT2_RSI_BUY:
+                            raise Exception(f"Alert 1 buy must be higher than Alert 2 buy ({ALERT2_RSI_BUY:.2f})")
+                        ALERT1_RSI_BUY = value
+                        reply_telegram(f"✅ Alert 1 buy updated to RSI <= {ALERT1_RSI_BUY:.2f}")
                     except Exception as e:
-                        reply_telegram(f"❌ Usage: /setrsibuyalert 5\n{e}")
-                elif lower.startswith("/setrsisellalert "):
+                        reply_telegram(f"❌ Usage: /setalert1buy 10
+{e}")
+                elif lower.startswith("/setalert1sell "):
                     try:
                         value = parse_float_command(text)
                         if not 0 <= value <= 100:
                             raise Exception("RSI value must be between 0 and 100")
-                        if value <= PREFERRED_RSI_BUY:
-                            raise Exception(f"Sell alert must be higher than buy alert ({PREFERRED_RSI_BUY:.2f})")
-                        PREFERRED_RSI_SELL = value
-                        reply_telegram(f"✅ Preferred RSI sell alert updated\nBuy alert <= {PREFERRED_RSI_BUY:.2f}\nSell alert >= {PREFERRED_RSI_SELL:.2f}")
+                        if value >= ALERT2_RSI_SELL:
+                            raise Exception(f"Alert 1 sell must be lower than Alert 2 sell ({ALERT2_RSI_SELL:.2f})")
+                        ALERT1_RSI_SELL = value
+                        reply_telegram(f"✅ Alert 1 sell updated to RSI >= {ALERT1_RSI_SELL:.2f}")
                     except Exception as e:
-                        reply_telegram(f"❌ Usage: /setrsisellalert 95\n{e}")
+                        reply_telegram(f"❌ Usage: /setalert1sell 85
+{e}")
+                elif lower.startswith("/setalert2buy "):
+                    try:
+                        value = parse_float_command(text)
+                        if not 0 <= value <= 100:
+                            raise Exception("RSI value must be between 0 and 100")
+                        if not (ALERT3_RSI_BUY < value < ALERT1_RSI_BUY):
+                            raise Exception(f"Alert 2 buy must be between Alert 3 buy ({ALERT3_RSI_BUY:.2f}) and Alert 1 buy ({ALERT1_RSI_BUY:.2f})")
+                        ALERT2_RSI_BUY = value
+                        reply_telegram(f"✅ Alert 2 buy updated to RSI <= {ALERT2_RSI_BUY:.2f}")
+                    except Exception as e:
+                        reply_telegram(f"❌ Usage: /setalert2buy 8
+{e}")
+                elif lower.startswith("/setalert2sell "):
+                    try:
+                        value = parse_float_command(text)
+                        if not 0 <= value <= 100:
+                            raise Exception("RSI value must be between 0 and 100")
+                        if not (ALERT1_RSI_SELL < value < ALERT3_RSI_SELL):
+                            raise Exception(f"Alert 2 sell must be between Alert 1 sell ({ALERT1_RSI_SELL:.2f}) and Alert 3 sell ({ALERT3_RSI_SELL:.2f})")
+                        ALERT2_RSI_SELL = value
+                        reply_telegram(f"✅ Alert 2 sell updated to RSI >= {ALERT2_RSI_SELL:.2f}")
+                    except Exception as e:
+                        reply_telegram(f"❌ Usage: /setalert2sell 93
+{e}")
+                elif lower.startswith("/setalert3buy ") or lower.startswith("/setrsibuyalert "):
+                    try:
+                        value = parse_float_command(text)
+                        if not 0 <= value <= 100:
+                            raise Exception("RSI value must be between 0 and 100")
+                        if value >= ALERT2_RSI_BUY:
+                            raise Exception(f"Alert 3 buy must be lower than Alert 2 buy ({ALERT2_RSI_BUY:.2f})")
+                        ALERT3_RSI_BUY = value
+                        reply_telegram(f"✅ Alert 3 buy updated to RSI <= {ALERT3_RSI_BUY:.2f}")
+                    except Exception as e:
+                        reply_telegram(f"❌ Usage: /setalert3buy 5
+{e}")
+                elif lower.startswith("/setalert3sell ") or lower.startswith("/setrsisellalert "):
+                    try:
+                        value = parse_float_command(text)
+                        if not 0 <= value <= 100:
+                            raise Exception("RSI value must be between 0 and 100")
+                        if value <= ALERT2_RSI_SELL:
+                            raise Exception(f"Alert 3 sell must be higher than Alert 2 sell ({ALERT2_RSI_SELL:.2f})")
+                        ALERT3_RSI_SELL = value
+                        reply_telegram(f"✅ Alert 3 sell updated to RSI >= {ALERT3_RSI_SELL:.2f}")
+                    except Exception as e:
+                        reply_telegram(f"❌ Usage: /setalert3sell 95
+{e}")
                 elif lower.startswith("/setbbalerts "):
                     try:
                         BB_ALERTS_ENABLED = parse_on_off(text.split(maxsplit=1)[1])
@@ -1502,10 +1650,10 @@ def telegram_command_loop():
                         value = parse_float_command(text)
                         if value < 0:
                             raise Exception("BB close/squeeze width cannot be negative")
-                        if value >= PREFERRED_BB_EXPANSION_WIDTH_PCT:
-                            raise Exception(f"Close/squeeze width must be lower than wide expansion width ({PREFERRED_BB_EXPANSION_WIDTH_PCT:.2f}%)")
-                        PREFERRED_BB_SQUEEZE_WIDTH_PCT = value
-                        reply_telegram(f"✅ BB close expansion/squeeze updated\nClose/squeeze <= {PREFERRED_BB_SQUEEZE_WIDTH_PCT:.2f}%\nWidest expansion >= {PREFERRED_BB_EXPANSION_WIDTH_PCT:.2f}%")
+                        if value >= BB_EXPANSION_WIDTH_PCT:
+                            raise Exception(f"Close/squeeze width must be lower than wide expansion width ({BB_EXPANSION_WIDTH_PCT:.2f}%)")
+                        BB_SQUEEZE_WIDTH_PCT = value
+                        reply_telegram(f"✅ BB close expansion/squeeze updated\nClose/squeeze <= {BB_SQUEEZE_WIDTH_PCT:.2f}%\nWidest expansion >= {BB_EXPANSION_WIDTH_PCT:.2f}%")
                     except Exception as e:
                         reply_telegram(f"❌ Usage: /setbbclose 1.5\n{e}")
                 elif lower.startswith("/setbbwide ") or lower.startswith("/setbbwidthhigh "):
@@ -1513,10 +1661,10 @@ def telegram_command_loop():
                         value = parse_float_command(text)
                         if value < 0:
                             raise Exception("BB wide expansion width cannot be negative")
-                        if value <= PREFERRED_BB_SQUEEZE_WIDTH_PCT:
-                            raise Exception(f"Wide expansion width must be higher than close/squeeze width ({PREFERRED_BB_SQUEEZE_WIDTH_PCT:.2f}%)")
-                        PREFERRED_BB_EXPANSION_WIDTH_PCT = value
-                        reply_telegram(f"✅ BB widest expansion updated\nClose/squeeze <= {PREFERRED_BB_SQUEEZE_WIDTH_PCT:.2f}%\nWidest expansion >= {PREFERRED_BB_EXPANSION_WIDTH_PCT:.2f}%")
+                        if value <= BB_SQUEEZE_WIDTH_PCT:
+                            raise Exception(f"Wide expansion width must be higher than close/squeeze width ({BB_SQUEEZE_WIDTH_PCT:.2f}%)")
+                        BB_EXPANSION_WIDTH_PCT = value
+                        reply_telegram(f"✅ BB widest expansion updated\nClose/squeeze <= {BB_SQUEEZE_WIDTH_PCT:.2f}%\nWidest expansion >= {BB_EXPANSION_WIDTH_PCT:.2f}%")
                     except Exception as e:
                         reply_telegram(f"❌ Usage: /setbbwide 4.0\n{e}")
                 elif lower.startswith("/setrsibuy "):
@@ -1739,13 +1887,17 @@ def main():
     print("DEFAULT_RSI_BUY =", DEFAULT_RSI_BUY)
     print("DEFAULT_RSI_SELL =", DEFAULT_RSI_SELL)
     print("RSI_ALERTS_ENABLED =", RSI_ALERTS_ENABLED)
-    print("PREFERRED_RSI_BUY =", PREFERRED_RSI_BUY)
-    print("PREFERRED_RSI_SELL =", PREFERRED_RSI_SELL)
+    print("ALERT1_RSI_BUY =", ALERT1_RSI_BUY)
+    print("ALERT1_RSI_SELL =", ALERT1_RSI_SELL)
+    print("ALERT2_RSI_BUY =", ALERT2_RSI_BUY)
+    print("ALERT2_RSI_SELL =", ALERT2_RSI_SELL)
+    print("ALERT3_RSI_BUY =", ALERT3_RSI_BUY)
+    print("ALERT3_RSI_SELL =", ALERT3_RSI_SELL)
     print("BB_ALERTS_ENABLED =", BB_ALERTS_ENABLED)
     print("BB_LENGTH =", BB_LENGTH)
     print("BB_STD_MULT =", BB_STD_MULT)
-    print("PREFERRED_BB_SQUEEZE_WIDTH_PCT =", PREFERRED_BB_SQUEEZE_WIDTH_PCT)
-    print("PREFERRED_BB_EXPANSION_WIDTH_PCT =", PREFERRED_BB_EXPANSION_WIDTH_PCT)
+    print("BB_SQUEEZE_WIDTH_PCT =", BB_SQUEEZE_WIDTH_PCT)
+    print("BB_EXPANSION_WIDTH_PCT =", BB_EXPANSION_WIDTH_PCT)
     print("TRADES_HISTORY_LIMIT =", TRADES_HISTORY_LIMIT)
     print("DAILY_REPORT_ENABLED =", DAILY_REPORT_ENABLED)
     print("DAILY_REPORT_HOUR =", DAILY_REPORT_HOUR)
