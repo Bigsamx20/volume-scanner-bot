@@ -1267,6 +1267,7 @@ def telegram_help_text():
         "/autoon - enable auto trading\n/autooff - disable auto trading\n/showstrategy - show auto strategy\n/showpositions - show tracked positions\n"
         "/rsi BTCUSDT - check RSI for any coin\n/rsi BTCUSDT 5 - check RSI for coin/timeframe\n/rsilow 10 - show lowest RSI coins being watched\n/rsihigh 10 - show highest RSI coins being watched\n"
         "/bb BTCUSDT - check Bollinger Bands for any coin\n/bb BTCUSDT 5 - check BB for coin/timeframe\n/bb low 10 - lowest BB width squeeze list\n/bb high 10 - highest BB width expansion list\n"
+        "/setbbwidthlow 1.5 - set BB squeeze width percent\n/setbbwidthhigh 4.0 - set BB expansion width percent\n"
         "/setrsibuy 5 - set buy threshold\n/setrsisell 95 - set sell threshold\n/setsl 0 - set stop loss percent (0 = OFF)\n/settp 3 - set take profit percent (0 = OFF)\n"
         "/settrailing 2 - set trailing stop percent (0 = OFF)\n/settrailstart 1 - set trailing activation percent (0 = immediate)\n/setmaxcoins 5 - set max simultaneous open positions\n"
         "/setcooldown 300 - set symbol cooldown seconds\n/setsize 20 - set trade size margin in USDT\n/setlev 3 - set leverage\n/help - command list"
@@ -1276,7 +1277,7 @@ def telegram_command_loop():
     global telegram_offset, last_command_time
     global AUTO_TRADING_ENABLED, NOTIFICATIONS_MUTED, STOP_LOSS_PCT, TAKE_PROFIT_PCT, TRAILING_STOP_PCT, TRAILING_START_PCT
     global BREAK_EVEN_ENABLED, BREAK_EVEN_TRIGGER_PCT, BREAK_EVEN_OFFSET_PCT
-    global RSI_BUY_THRESHOLD, RSI_SELL_THRESHOLD, MAX_OPEN_POSITIONS, SYMBOL_COOLDOWN_SECONDS, TRADE_SIZE_USDT, LEVERAGE
+    global RSI_BUY_THRESHOLD, RSI_SELL_THRESHOLD, BB_SQUEEZE_WIDTH_PCT, BB_EXPANSION_WIDTH_PCT, MAX_OPEN_POSITIONS, SYMBOL_COOLDOWN_SECONDS, TRADE_SIZE_USDT, LEVERAGE
     if not TELEGRAM_ENABLED:
         print("Telegram command loop disabled")
         return
@@ -1417,6 +1418,36 @@ def telegram_command_loop():
                             reply_telegram("❌ Usage:\n/bb BTCUSDT\n/bb BTCUSDT 5\n/bb low 10\n/bb high 10")
                     except Exception as e:
                         reply_telegram(f"❌ BB command failed\nUsage: /bb low 10 or /bb high 10 or /bb BTCUSDT\n{e}")
+                elif text.startswith("/setbbwidthlow "):
+                    try:
+                        value = float(text.split(maxsplit=1)[1].strip())
+                        if value < 0:
+                            raise Exception("BB squeeze width cannot be negative")
+                        if value >= BB_EXPANSION_WIDTH_PCT:
+                            raise Exception(f"BB squeeze width must be lower than expansion width ({BB_EXPANSION_WIDTH_PCT:.2f}%)")
+                        BB_SQUEEZE_WIDTH_PCT = value
+                        reply_telegram(
+                            f"✅ BB squeeze width updated\n"
+                            f"Squeeze <= {BB_SQUEEZE_WIDTH_PCT:.2f}%\n"
+                            f"Expansion >= {BB_EXPANSION_WIDTH_PCT:.2f}%"
+                        )
+                    except Exception as e:
+                        reply_telegram(f"❌ Failed to set BB squeeze width\nUsage: /setbbwidthlow 1.5\n{e}")
+                elif text.startswith("/setbbwidthhigh "):
+                    try:
+                        value = float(text.split(maxsplit=1)[1].strip())
+                        if value < 0:
+                            raise Exception("BB expansion width cannot be negative")
+                        if value <= BB_SQUEEZE_WIDTH_PCT:
+                            raise Exception(f"BB expansion width must be higher than squeeze width ({BB_SQUEEZE_WIDTH_PCT:.2f}%)")
+                        BB_EXPANSION_WIDTH_PCT = value
+                        reply_telegram(
+                            f"✅ BB expansion width updated\n"
+                            f"Squeeze <= {BB_SQUEEZE_WIDTH_PCT:.2f}%\n"
+                            f"Expansion >= {BB_EXPANSION_WIDTH_PCT:.2f}%"
+                        )
+                    except Exception as e:
+                        reply_telegram(f"❌ Failed to set BB expansion width\nUsage: /setbbwidthhigh 4.0\n{e}")
                 elif text.startswith("/setrsibuy "):
                     try:
                         RSI_BUY_THRESHOLD = float(text.split(maxsplit=1)[1].strip())
