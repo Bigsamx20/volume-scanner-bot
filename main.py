@@ -107,6 +107,7 @@ ws_lock = threading.Lock()
 positions_lock = threading.Lock()
 bybit_symbols_lock = threading.Lock()
 trades_lock = threading.Lock()
+bb_settings_lock = threading.RLock()
 ws_connections = {}
 current_candle_start = {}
 last_ws_message_at = 0
@@ -135,6 +136,13 @@ positions = {}
 symbol_cooldowns = {}
 closed_trades = []
 last_daily_report_date = None
+
+# Per-symbol BB overrides. Runtime commands update these dictionaries.
+# Optional env examples:
+#   BB_SYMBOL_CLOSE_WIDTH_PCT="BTCUSDT=1.2,ETHUSDT=1.8"
+#   BB_SYMBOL_WIDE_WIDTH_PCT="BTCUSDT=5,ETHUSDT=6"
+BB_SYMBOL_CLOSE_WIDTH_PCT = {}
+BB_SYMBOL_WIDE_WIDTH_PCT = {}
 
 # =========================================================
 # SAFE HELPERS
@@ -192,6 +200,35 @@ def parse_on_off(value):
 def parse_float_arg(text):
     return float(text.split(maxsplit=1)[1].strip())
 
+def parse_bb_set_command(text):
+    parts = text.split()
+    if len(parts) == 2:
+        return None, float(parts[1])
+    if len(parts) == 3:
+        return normalize_symbol(parts[1]), float(parts[2])
+    raise ValueError("Usage: /setbbclose 1.5 or /setbbclose BTCUSDT 1.5")
+
+def parse_symbol_float_map(raw):
+    result = {}
+    raw = str(raw or "").strip()
+    if not raw:
+        return result
+    for chunk in raw.split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        if "=" in item:
+            symbol, value = item.split("=", 1)
+        elif ":" in item:
+            symbol, value = item.split(":", 1)
+        else:
+            continue
+        try:
+            result[normalize_symbol(symbol)] = float(value.strip())
+        except Exception:
+            continue
+    return result
+
 def ensure_symbol_state(symbol):
     symbol = normalize_symbol(symbol)
     if symbol not in data:
@@ -236,6 +273,69 @@ def floor_to_step_str(value, step_str):
 def fmt_qty_or_price(value):
     s = str(value)
     return s.rstrip("0").rstrip(".") if "." in s else s
+
+BB_SYMBOL_CLOSE_WIDTH_PCT.update(parse_symbol_float_map(os.getenv("BB_SYMBOL_CLOSE_WIDTH_PCT", os.getenv("BB_CLOSE_SYMBOLS", ""))))
+BB_SYMBOL_WIDE_WIDTH_PCT.update(parse_symbol_float_map(os.getenv("BB_SYMBOL_WIDE_WIDTH_PCT", os.getenv("BB_WIDE_SYMBOLS", ""))))
+
+# =========================================================
+# BB SETTINGS HELPERS
+# =========================================================
+def get_bb_thresholds(symbol):
+    symbol = normalize_symbol(symbol)
+    with bb_settings_lock:
+        close_value = BB_SYMBOL_CLOSE_WIDTH_PCT.get(symbol, BB_CLOSE_WIDTH_PCT)
+        wide_value = BB_SYMBOL_WIDE_WIDTH_PCT.get(symbol, BB_WIDE_WIDTH_PCT)
+        close_source = "symbol" if symbol in BB_SYMBOL_CLOSE_WIDTH_PCT else "global"
+        wide_source = "symbol" if symbol in BB_SYMBOL_WIDE_WIDTH_PCT else "global"
+    return close_value, wide_value, close_source, wide_source
+
+def get_bb_settings_text(symbol=None):
+    if symbol:
+        sym = normalize_symbol(symbol)
+        close_value, wide_value, close_source, wide_source = get_bb_thresholds(sym)
+        return "⚙️ BB SETTINGS\nSymbol: {}\nClose: <= {:.2f}% ({})\nWide: >= {:.2f}% ({})\nGlobal close: <= {:.2f}%\nGlobal wide: >= {:.2f}%".format(sym, close_value, close_source, wide_value, wide_source, BB_CLOSE_WIDTH_PCT, BB_WIDE_WIDTH_PCT)
+
+    with bb_settings_lock:
+        close_items = sorted(BB_SYMBOL_CLOSE_WIDTH_PCT.items())
+        wide_items = sorted(BB_SYMBOL_WIDE_WIDTH_PCT.items())
+
+    lines = [
+        "⚙️ BB SETTINGS",
+        "Global close: <= {:.2f}%".format(BB_CLOSE_WIDTH_PCT),
+        "Global wide: >= {:.2f}%".format(BB_WIDE_WIDTH_PCT),
+        "Per-symbol close overrides: {}".format(len(close_items)),
+        "Per-symbol wide overrides: {}".format(len(wide_items)),
+    ]
+
+    if close_items:
+        lines.append("")
+        lines.append("Close overrides:")
+        for sym, value in close_items[:30]:
+            lines.append("{} <= {:.2f}%".format(sym, value))
+
+    if wide_items:
+        lines.append("")
+        lines.append("Wide overrides:")
+        for sym, value in wide_items[:30]:
+            lines.append("{} >= {:.2f}%".format(sym, value))
+
+    if len(close_items) > 30 or len(wide_items) > 30:
+        lines.append("")
+        lines.append("Showing first 30 overrides per list.")
+
+    return "\n".join(lines)
+
+def clear_bb_symbol_setting(symbol, side="all"):
+    symbol = normalize_symbol(symbol)
+    side = str(side or "all").strip().lower()
+    if side not in ("close", "low", "squeeze", "wide", "high", "expansion", "all"):
+        raise ValueError("Use all, close, or wide")
+    with bb_settings_lock:
+        if side in ("close", "low", "squeeze", "all"):
+            BB_SYMBOL_CLOSE_WIDTH_PCT.pop(symbol, None)
+        if side in ("wide", "high", "expansion", "all"):
+            BB_SYMBOL_WIDE_WIDTH_PCT.pop(symbol, None)
+    return symbol
 
 # =========================================================
 # TELEGRAM
@@ -383,16 +483,17 @@ def process_bb_alerts(symbol, tf, candle_start, bb):
         return
 
     width = bb["width_pct"]
+    close_pct, wide_pct, close_source, wide_source = get_bb_thresholds(symbol)
 
-    if BB_CLOSE_ALERT_ENABLED and width <= BB_CLOSE_WIDTH_PCT:
+    if BB_CLOSE_ALERT_ENABLED and width <= close_pct:
         if should_alert_once_per_candle("bb_close", symbol, tf, candle_start):
-            msg = "🟡 BB CLOSE ALERT\nSymbol: {}\nTimeframe: {}m\nBB width: {:.2f}%\nYour setup: BB width <= {:.2f}%".format(symbol, tf, width, BB_CLOSE_WIDTH_PCT)
+            msg = "🟡 BB CLOSE ALERT\nSymbol: {}\nTimeframe: {}m\nBB width: {:.2f}%\nYour setup: BB width <= {:.2f}% ({})".format(symbol, tf, width, close_pct, close_source)
             send_to_private_and_optional_group(msg, SEND_BB_CLOSE_TO_GROUP)
         return
 
-    if BB_WIDE_ALERT_ENABLED and width >= BB_WIDE_WIDTH_PCT:
+    if BB_WIDE_ALERT_ENABLED and width >= wide_pct:
         if should_alert_once_per_candle("bb_wide", symbol, tf, candle_start):
-            msg = "🟢 BB WIDE ALERT\nSymbol: {}\nTimeframe: {}m\nBB width: {:.2f}%\nYour setup: BB width >= {:.2f}%".format(symbol, tf, width, BB_WIDE_WIDTH_PCT)
+            msg = "🟢 BB WIDE ALERT\nSymbol: {}\nTimeframe: {}m\nBB width: {:.2f}%\nYour setup: BB width >= {:.2f}% ({})".format(symbol, tf, width, wide_pct, wide_source)
             send_to_private_and_optional_group(msg, SEND_BB_WIDE_TO_GROUP)
         return
 
@@ -514,8 +615,9 @@ def get_any_symbol_bb_text(symbol, tf="5"):
         if bb is None:
             return "⚠️ Not enough candle data for BB on {} {}m.".format(symbol, tf)
         width = bb["width_pct"]
-        state = "BB CLOSE ALERT ZONE" if width <= BB_CLOSE_WIDTH_PCT else "BB WIDE ALERT ZONE" if width >= BB_WIDE_WIDTH_PCT else "NORMAL"
-        return "📊 BB WIDTH CHECK\nSymbol: {}\nTimeframe: {}m\nBB({}, {})\nUpper: {:.8f}\nMiddle: {:.8f}\nLower: {:.8f}\nWidth: {:.2f}%\nState: {}\nClose alert enabled: {}\nWide alert enabled: {}\nYour close setup: <= {:.2f}%\nYour wide setup: >= {:.2f}%".format(symbol, tf, BB_LENGTH, BB_STD_MULT, bb["upper"], bb["middle"], bb["lower"], width, state, bool_text(BB_CLOSE_ALERT_ENABLED), bool_text(BB_WIDE_ALERT_ENABLED), BB_CLOSE_WIDTH_PCT, BB_WIDE_WIDTH_PCT)
+        close_pct, wide_pct, close_source, wide_source = get_bb_thresholds(symbol)
+        state = "BB CLOSE ALERT ZONE" if width <= close_pct else "BB WIDE ALERT ZONE" if width >= wide_pct else "NORMAL"
+        return "📊 BB WIDTH CHECK\nSymbol: {}\nTimeframe: {}m\nBB({}, {})\nUpper: {:.8f}\nMiddle: {:.8f}\nLower: {:.8f}\nWidth: {:.2f}%\nState: {}\nClose alert enabled: {}\nWide alert enabled: {}\nYour close setup: <= {:.2f}% ({})\nYour wide setup: >= {:.2f}% ({})".format(symbol, tf, BB_LENGTH, BB_STD_MULT, bb["upper"], bb["middle"], bb["lower"], width, state, bool_text(BB_CLOSE_ALERT_ENABLED), bool_text(BB_WIDE_ALERT_ENABLED), close_pct, close_source, wide_pct, wide_source)
     except Exception as e:
         log_error("get_any_symbol_bb_text", e)
         return "❌ Failed to check BB for {}\n{}".format(symbol, e)
@@ -553,7 +655,9 @@ def get_bb_rankings_text(mode="low", limit=10):
     title = "🟢 WIDEST BB WIDTH" if reverse else "🟡 CLOSEST BB WIDTH"
     lines = [title, "Timeframe: 5m", "BB: length={}, std={}".format(BB_LENGTH, BB_STD_MULT), ""]
     for i, (symbol, width) in enumerate(rows[:limit], start=1):
-        lines.append("{}. {} — BB width: {:.2f}%".format(i, symbol, width))
+        close_pct, wide_pct, _, _ = get_bb_thresholds(symbol)
+        setup = "close<= {:.2f}%".format(close_pct) if not reverse else "wide>= {:.2f}%".format(wide_pct)
+        lines.append("{}. {} — BB width: {:.2f}% | {}".format(i, symbol, width, setup))
     return "\n".join(lines)
 
 # =========================================================
@@ -1119,7 +1223,10 @@ def get_status_text():
     with shortlist_lock:
         short_count = len(shortlist)
         live_count = len(live_symbols)
-    return "✅ Bot running\nCategory: {}\nLive symbols: {}\nShortlist: {}\nTelegram: {}\nMuted: {}\nBybit trading: {}\nAuto trading: {}\nOpen positions: {}\nRSI alerts: {}\nA1 buy/sell: <= {:.2f} / >= {:.2f}\nA2 buy/sell: <= {:.2f} / >= {:.2f}\nA3 buy/sell: <= {:.2f} / >= {:.2f}\nBB alerts master: {}\nBB close alert: {}\nBB wide alert: {}\nBB close setup <= {:.2f}%\nBB wide setup >= {:.2f}%\nSL: {}\nTP: {}\nTrailing: {}\nSize: {:.4f} USDT\nLeverage: {}x".format(CATEGORY, live_count, short_count, TELEGRAM_ENABLED, NOTIFICATIONS_MUTED, BYBIT_TRADING_ENABLED, AUTO_TRADING_ENABLED, get_open_positions_count(), bool_text(RSI_ALERTS_ENABLED), ALERT1_RSI_BUY, ALERT1_RSI_SELL, ALERT2_RSI_BUY, ALERT2_RSI_SELL, ALERT3_RSI_BUY, ALERT3_RSI_SELL, bool_text(BB_ALERTS_ENABLED), bool_text(BB_CLOSE_ALERT_ENABLED), bool_text(BB_WIDE_ALERT_ENABLED), BB_CLOSE_WIDTH_PCT, BB_WIDE_WIDTH_PCT, pct_text(STOP_LOSS_PCT), pct_text(TAKE_PROFIT_PCT), pct_text(TRAILING_STOP_PCT), TRADE_SIZE_USDT, LEVERAGE)
+    with bb_settings_lock:
+        close_override_count = len(BB_SYMBOL_CLOSE_WIDTH_PCT)
+        wide_override_count = len(BB_SYMBOL_WIDE_WIDTH_PCT)
+    return "✅ Bot running\nCategory: {}\nLive symbols: {}\nShortlist: {}\nTelegram: {}\nMuted: {}\nBybit trading: {}\nAuto trading: {}\nOpen positions: {}\nRSI alerts: {}\nA1 buy/sell: <= {:.2f} / >= {:.2f}\nA2 buy/sell: <= {:.2f} / >= {:.2f}\nA3 buy/sell: <= {:.2f} / >= {:.2f}\nBB alerts master: {}\nBB close alert: {}\nBB wide alert: {}\nBB global close setup <= {:.2f}%\nBB global wide setup >= {:.2f}%\nBB close symbol overrides: {}\nBB wide symbol overrides: {}\nSL: {}\nTP: {}\nTrailing: {}\nSize: {:.4f} USDT\nLeverage: {}x".format(CATEGORY, live_count, short_count, TELEGRAM_ENABLED, NOTIFICATIONS_MUTED, BYBIT_TRADING_ENABLED, AUTO_TRADING_ENABLED, get_open_positions_count(), bool_text(RSI_ALERTS_ENABLED), ALERT1_RSI_BUY, ALERT1_RSI_SELL, ALERT2_RSI_BUY, ALERT2_RSI_SELL, ALERT3_RSI_BUY, ALERT3_RSI_SELL, bool_text(BB_ALERTS_ENABLED), bool_text(BB_CLOSE_ALERT_ENABLED), bool_text(BB_WIDE_ALERT_ENABLED), BB_CLOSE_WIDTH_PCT, BB_WIDE_WIDTH_PCT, close_override_count, wide_override_count, pct_text(STOP_LOSS_PCT), pct_text(TAKE_PROFIT_PCT), pct_text(TRAILING_STOP_PCT), TRADE_SIZE_USDT, LEVERAGE)
 
 def get_diag_text():
     age = now_ts() - last_ws_message_at if last_ws_message_at else -1
@@ -1146,6 +1253,8 @@ def telegram_help_text():
         "/setbbalerts on|off\n"
         "/setbbclosealert on|off | /setbbwidealert on|off\n"
         "/setbbclose 1.5 | /setbbwide 4\n"
+        "/setbbclose BTCUSDT 1.2 | /setbbwide BTCUSDT 5\n"
+        "/bbsettings | /bbsettings BTCUSDT | /clearbb BTCUSDT all|close|wide\n"
         "/autoon /autooff /buy /sell /panicclose\n"
         "/showpositions /pnl /dailyreport /trades\n"
         "/setrsibuy 5 /setrsisell 95 /setsl 0 /settp 3\n"
@@ -1261,6 +1370,16 @@ def telegram_command_loop():
                         parts = text.split()
                         limit = int(parts[1]) if len(parts) >= 2 else 10
                         reply_telegram(get_rsi_rankings_text("high", max(1, min(limit, 50))))
+                    elif lower.startswith("/bbsettings"):
+                        parts = text.split()
+                        reply_telegram(get_bb_settings_text(parts[1] if len(parts) >= 2 else None))
+                    elif lower.startswith("/clearbb "):
+                        parts = text.split()
+                        if len(parts) < 2:
+                            raise ValueError("Usage: /clearbb BTCUSDT all|close|wide")
+                        side = parts[2] if len(parts) >= 3 else "all"
+                        sym = clear_bb_symbol_setting(parts[1], side)
+                        reply_telegram("✅ Cleared BB {} override for {}".format(side, sym))
                     elif lower.startswith("/bb"):
                         parts = text.split()
                         if len(parts) >= 2 and parts[1].lower() in ("close", "low", "lowest", "squeeze"):
@@ -1323,17 +1442,37 @@ def telegram_command_loop():
                         BB_WIDE_ALERT_ENABLED = parse_on_off(text.split(maxsplit=1)[1])
                         reply_telegram("✅ BB wide alert: {}".format(bool_text(BB_WIDE_ALERT_ENABLED)))
                     elif lower.startswith("/setbbclose ") or lower.startswith("/setbbwidthlow "):
-                        v = parse_float_arg(text)
-                        if v < 0 or v >= BB_WIDE_WIDTH_PCT:
-                            raise ValueError("BB close must be lower than BB wide")
-                        BB_CLOSE_WIDTH_PCT = v
-                        reply_telegram("✅ BB close setup <= {:.2f}%".format(v))
+                        sym, v = parse_bb_set_command(text)
+                        if v < 0:
+                            raise ValueError("BB close cannot be negative")
+                        if sym is None:
+                            if v >= BB_WIDE_WIDTH_PCT:
+                                raise ValueError("BB close must be lower than BB wide")
+                            BB_CLOSE_WIDTH_PCT = v
+                            reply_telegram("✅ BB global close setup <= {:.2f}%".format(v))
+                        else:
+                            _, wide_pct, _, _ = get_bb_thresholds(sym)
+                            if v >= wide_pct:
+                                raise ValueError("BB close for {} must be lower than its wide setting ({:.2f}%)".format(sym, wide_pct))
+                            with bb_settings_lock:
+                                BB_SYMBOL_CLOSE_WIDTH_PCT[sym] = v
+                            reply_telegram("✅ BB close setup for {} <= {:.2f}%".format(sym, v))
                     elif lower.startswith("/setbbwide ") or lower.startswith("/setbbwidthhigh "):
-                        v = parse_float_arg(text)
-                        if v <= BB_CLOSE_WIDTH_PCT:
-                            raise ValueError("BB wide must be higher than BB close")
-                        BB_WIDE_WIDTH_PCT = v
-                        reply_telegram("✅ BB wide setup >= {:.2f}%".format(v))
+                        sym, v = parse_bb_set_command(text)
+                        if v < 0:
+                            raise ValueError("BB wide cannot be negative")
+                        if sym is None:
+                            if v <= BB_CLOSE_WIDTH_PCT:
+                                raise ValueError("BB wide must be higher than BB close")
+                            BB_WIDE_WIDTH_PCT = v
+                            reply_telegram("✅ BB global wide setup >= {:.2f}%".format(v))
+                        else:
+                            close_pct, _, _, _ = get_bb_thresholds(sym)
+                            if v <= close_pct:
+                                raise ValueError("BB wide for {} must be higher than its close setting ({:.2f}%)".format(sym, close_pct))
+                            with bb_settings_lock:
+                                BB_SYMBOL_WIDE_WIDTH_PCT[sym] = v
+                            reply_telegram("✅ BB wide setup for {} >= {:.2f}%".format(sym, v))
                     elif lower.startswith("/setrsibuy "):
                         RSI_BUY_THRESHOLD = parse_float_arg(text)
                         reply_telegram("✅ Auto buy RSI <= {:.2f}".format(RSI_BUY_THRESHOLD))
@@ -1481,7 +1620,7 @@ def main():
     print("BYBIT_TRADING_ENABLED =", BYBIT_TRADING_ENABLED)
     print("BYBIT_KEYS_READY =", bybit_keys_ready())
     print("RSI TIERS:", ALERT1_RSI_BUY, ALERT1_RSI_SELL, ALERT2_RSI_BUY, ALERT2_RSI_SELL, ALERT3_RSI_BUY, ALERT3_RSI_SELL)
-    print("BB:", BB_LENGTH, BB_STD_MULT, "close", BB_CLOSE_WIDTH_PCT, "wide", BB_WIDE_WIDTH_PCT, "close_alert", BB_CLOSE_ALERT_ENABLED, "wide_alert", BB_WIDE_ALERT_ENABLED)
+    print("BB:", BB_LENGTH, BB_STD_MULT, "global close", BB_CLOSE_WIDTH_PCT, "global wide", BB_WIDE_WIDTH_PCT, "close_alert", BB_CLOSE_ALERT_ENABLED, "wide_alert", BB_WIDE_ALERT_ENABLED, "symbol_close_overrides", len(BB_SYMBOL_CLOSE_WIDTH_PCT), "symbol_wide_overrides", len(BB_SYMBOL_WIDE_WIDTH_PCT))
 
     start_daemon(telegram_sender_loop, "telegram_sender")
     send_telegram("🚀 Scanner started")
