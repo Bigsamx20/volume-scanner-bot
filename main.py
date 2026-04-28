@@ -442,34 +442,37 @@ def process_rsi_tier_alerts(symbol, tf, candle_start, rsi_value):
     if not RSI_ALERTS_ENABLED:
         return
 
+    # ===== ALERT 3 (NO RSI SHOWN) =====
     if rsi_value >= ALERT3_RSI_SELL:
         if should_alert_once_per_candle("alert3_rsi_sell", symbol, tf, candle_start):
-            msg = "🚨 ALERT 3 - RSI SELL NOW\nSymbol: {}\nTimeframe: {}m\nRSI: {:.2f}\nYour setup: RSI >= {:.2f}".format(symbol, tf, rsi_value, ALERT3_RSI_SELL)
+            msg = "🚨 ALERT 3 - SELL NOW\nSymbol: {}\nTimeframe: {}m".format(symbol, tf)
             send_to_private_and_optional_group(msg, SEND_ALERT3_TO_GROUP)
         return
 
+    if rsi_value <= ALERT3_RSI_BUY:
+        if should_alert_once_per_candle("alert3_rsi_buy", symbol, tf, candle_start):
+            msg = "🚨 ALERT 3 - BUY NOW\nSymbol: {}\nTimeframe: {}m".format(symbol, tf)
+            send_to_private_and_optional_group(msg, SEND_ALERT3_TO_GROUP)
+        return
+
+    # ===== ALERT 2 =====
     if rsi_value >= ALERT2_RSI_SELL:
         if should_alert_once_per_candle("alert2_rsi_sell", symbol, tf, candle_start):
             msg = "🔥 ALERT 2 - EXTREME SELL\nSymbol: {}\nTimeframe: {}m\nRSI: {:.2f}\nYour setup: RSI >= {:.2f}".format(symbol, tf, rsi_value, ALERT2_RSI_SELL)
             send_to_private_and_optional_group(msg, SEND_ALERT2_TO_GROUP)
         return
 
-    if rsi_value >= ALERT1_RSI_SELL:
-        if should_alert_once_per_candle("alert1_rsi_sell", symbol, tf, candle_start):
-            msg = "🚨 ALERT 1 - RSI SELL\nSymbol: {}\nTimeframe: {}m\nRSI: {:.2f}\nYour setup: RSI >= {:.2f}".format(symbol, tf, rsi_value, ALERT1_RSI_SELL)
-            send_to_private_and_optional_group(msg, SEND_ALERT1_TO_GROUP)
-        return
-
-    if rsi_value <= ALERT3_RSI_BUY:
-        if should_alert_once_per_candle("alert3_rsi_buy", symbol, tf, candle_start):
-            msg = "🚨 ALERT 3 - RSI BUY NOW\nSymbol: {}\nTimeframe: {}m\nRSI: {:.2f}\nYour setup: RSI <= {:.2f}".format(symbol, tf, rsi_value, ALERT3_RSI_BUY)
-            send_to_private_and_optional_group(msg, SEND_ALERT3_TO_GROUP)
-        return
-
     if rsi_value <= ALERT2_RSI_BUY:
         if should_alert_once_per_candle("alert2_rsi_buy", symbol, tf, candle_start):
             msg = "🔥 ALERT 2 - EXTREME BUY\nSymbol: {}\nTimeframe: {}m\nRSI: {:.2f}\nYour setup: RSI <= {:.2f}".format(symbol, tf, rsi_value, ALERT2_RSI_BUY)
             send_to_private_and_optional_group(msg, SEND_ALERT2_TO_GROUP)
+        return
+
+    # ===== ALERT 1 =====
+    if rsi_value >= ALERT1_RSI_SELL:
+        if should_alert_once_per_candle("alert1_rsi_sell", symbol, tf, candle_start):
+            msg = "🚨 ALERT 1 - RSI SELL\nSymbol: {}\nTimeframe: {}m\nRSI: {:.2f}\nYour setup: RSI >= {:.2f}".format(symbol, tf, rsi_value, ALERT1_RSI_SELL)
+            send_to_private_and_optional_group(msg, SEND_ALERT1_TO_GROUP)
         return
 
     if rsi_value <= ALERT1_RSI_BUY:
